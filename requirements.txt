@@ -1,5 +1,5 @@
 python-dotenv
-altair==5.5.0
+altair==4.2.2
 asttokens==3.0.0
 attrs==25.3.0
 blinker==1.9.0
