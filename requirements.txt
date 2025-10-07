@@ -1,4 +1,5 @@
 python-dotenv
+matplotlib==3.8.0
 altair==5.5.0
 asttokens==3.0.0
 attrs==25.3.0
@@ -74,3 +75,4 @@ urllib3==2.5.0
 watchdog==6.0.0
 wcwidth==0.2.14
 xlrd==2.0.2
+streamlit-aggrid==0.3.5

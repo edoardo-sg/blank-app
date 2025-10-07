@@ -1,24 +1,27 @@
 import sys
 print("USING PYTHON:", sys.executable)
 
+import os
+import math
+import calendar
+import warnings
+from datetime import datetime, timedelta
+
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
-import warnings
-import math
-import calendar
+
 warnings.filterwarnings('ignore')
 
 from dotenv import load_dotenv
 load_dotenv()  # carica .env se presente
 
-## Prophet non viene più caricato
-
+# -------------------------------
 # Configurazione pagina
+# -------------------------------
 st.set_page_config(
     page_title="Small Giants - Inventory Forecast",
     page_icon="📊",
@@ -26,9 +29,9 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-import os
-import streamlit as st
-
+# -------------------------------
+# AUTH
+# -------------------------------
 def gate():
     import os
     import streamlit as st
@@ -38,7 +41,6 @@ def gate():
 
     st.markdown("## 🔐 Login")
 
-    # Form con key univoca e widget con key dedicate
     with st.form("login_form", clear_on_submit=False):
         user = st.text_input("Username", key="login_user")
         pwd  = st.text_input("Password", type="password", key="login_pwd")
@@ -53,9 +55,9 @@ def gate():
     if not st.session_state.get("_auth_ok", False):
         st.stop()  # blocca il resto dell'app finché non logghi
 
-
-
-# CSS personalizzato per migliorare l'aspetto
+# -------------------------------
+# CSS
+# -------------------------------
 st.markdown("""
 <style>
 .main-header {
@@ -64,6 +66,9 @@ st.markdown("""
     color: #1f77b4;
     text-align: center;
     margin-bottom: 2rem;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+    white-space: normal;
 }
 .metric-container {
     background: #f0f2f6;
@@ -74,11 +79,15 @@ st.markdown("""
 .status-critical { color: #ff4444; font-weight: bold; }
 .status-warning { color: #ffaa00; font-weight: bold; }
 .status-good { color: #00aa44; font-weight: bold; }
+.small-note { font-size: 0.85rem; color: #666; }
+.ag-theme-balham .ag-cell-wrap-text {white-space: normal !important;}
 </style>
 """, unsafe_allow_html=True)
 
+# -------------------------------
+# Traduzioni
+# -------------------------------
 def load_translations():
-    """Definizioni multilingua"""
     return {
         'it': {
             'title': 'Small Giants - Previsione Inventario',
@@ -128,10 +137,10 @@ def load_translations():
         }
     }
 
+# -------------------------------
+# Utils
+# -------------------------------
 def find_column(df, possible_names):
-    """
-    Trova una colonna basandosi su una lista di possibili nomi (case insensitive)
-    """
     for col in df.columns:
         for possible_name in possible_names:
             if possible_name.lower() in col.lower():
@@ -139,369 +148,272 @@ def find_column(df, possible_names):
     return None
 
 def process_stock_file(df):
-    """
-    Processa il file con le quantità attuali in magazzino
-    """
+    if df is None or df.empty or len(df.columns) == 0:
+        st.error("❌ File stock non valido o vuoto")
+        return pd.DataFrame()
+
     try:
         st.write("🔍 **Colonne stock trovate nel file:**", list(df.columns))
-        
-        # Pulisci i nomi delle colonne
-        df.columns = df.columns.str.strip()
+        df.columns = df.columns.astype(str).str.replace('\ufeff','', regex=False).str.strip()
 
-        # Se la prima colonna contiene il nome del file, le intestazioni sono nella prima riga
         if 'export' in str(df.columns[0]).lower() or 'unnamed' in str(df.columns[0]).lower():
             st.info("📋 Rilevate intestazioni nella prima riga del file stock. Riprocessando...")
-            # La prima riga contiene i veri nomi delle colonne
             df.columns = df.iloc[0]
             df = df[1:].reset_index(drop=True)
-            df.columns = df.columns.str.strip()
+            df.columns = df.columns.astype(str).str.strip()
             st.write("🔍 **Colonne stock corrette:**", list(df.columns))
-            
-        # Trova colonne magazzino per filtrare SMALLGIANTSAVAILABLE
+
         physical_warehouse_col = find_column(df, ['magazzino fisico', 'physical warehouse', 'warehouse physical', 'deposito fisico', 'wms', 'warehouse'])
-        virtual_warehouse_col = find_column(df, ['magazzino virtuale', 'virtual warehouse', 'warehouse virtual', 'deposito virtuale', 'wms', 'warehouse'])
-        
-        # Filtra SOLO prodotti con ESATTAMENTE "SMALLGIANTSAVAILABLE"
-        if physical_warehouse_col or virtual_warehouse_col:
+        if physical_warehouse_col:
             initial_rows = len(df)
-            filter_mask = pd.Series([False] * len(df))
-            
-            if physical_warehouse_col:
-                # Match esatto su "SMALLGIANTSAVAILABLE" (trim spazi ma case sensitive)
-                physical_match = df[physical_warehouse_col].astype(str).str.strip() == 'SMALLGIANTSAVAILABLE'
-                filter_mask = filter_mask | physical_match
-            
-            if virtual_warehouse_col:
-                virtual_match = df[virtual_warehouse_col].astype(str).str.strip() == 'SMALLGIANTSAVAILABLE'
-                filter_mask = filter_mask | virtual_match
-            
-            df = df[filter_mask].copy()
+            warehouse_values = ['SMALLGIANTSAVAILABLE', 'SmallGiantsAvailable', 'SMALL GIANTS AVAILABLE']
+            physical_match = df[physical_warehouse_col].astype(str).str.strip().isin(warehouse_values)
+            st.write("🔍 Debug filtro magazzino:")
+            st.write(f"   • Colonna usata: {physical_warehouse_col}")
+            st.write(f"   • Valori unici trovati: {df[physical_warehouse_col].unique()}")
+            st.write(f"   • Match trovati: {physical_match.sum()}")
+            df = df[physical_match].copy()
             filtered_count = initial_rows - len(df)
-            
             if filtered_count > 0:
                 st.info(f"🔍 Esclusi {filtered_count} prodotti non-SMALLGIANTSAVAILABLE (selezionati {len(df)} prodotti)")
-            
             if len(df) == 0:
                 st.warning("⚠️ Nessun prodotto con esattamente 'SMALLGIANTSAVAILABLE' trovato nel file stock")
                 return pd.DataFrame()
-            
             st.success(f"✅ Filtrati solo prodotti SMALLGIANTSAVAILABLE: {len(df)} prodotti")
         else:
-            st.error("❌ Colonne 'Magazzino fisico' o 'Magazzino virtuale' non trovate. Impossibile filtrare.")
+            st.error("❌ Colonna magazzino non trovata. Impossibile filtrare.")
             return pd.DataFrame()
-        
-        # Trova le colonne chiave per il file stock
+
         sku_column = find_column(df, ['sku interno', 'internal sku', 'sku', 'codice', 'code'])
         available_column = find_column(df, ['disponibile', 'available', 'qtà disponibile', 'q.tà disponibile'])
         in_stock_column = find_column(df, ['in stock', 'stock', 'qtà in stock', 'q.tà in stock'])
         product_name_column = find_column(df, ['nome del prodotto', 'product name', 'nome', 'name', 'prodotto'])
-        
-        # Trova anche altre colonne utili
-        reserved_column = find_column(df, ['prenotate', 'reserved', 'qtà prenotate', 'q.tà prenotate'])
-        incoming_column = find_column(df, ['attesa di ricezione', 'incoming', 'in attesa', 'ricezione'])
+        reserved_column = find_column(df, ['prenotate', 'booked', 'reserved', 'qtà prenotate', 'q.tà prenotate'])
+        incoming_column = find_column(df, ['attesa di ricezione', 'incoming', 'in attesa', 'ricezione', 'required'])
 
-        # Trova colonne magazzino per filtrare SMALLGIANTSAVAILABLE
-        physical_warehouse_col = find_column(df, ['magazzino fisico', 'physical warehouse', 'warehouse physical', 'deposito fisico', 'wms', 'warehouse'])
-        virtual_warehouse_col = find_column(df, ['magazzino virtuale', 'virtual warehouse', 'warehouse virtual', 'deposito virtuale', 'wms', 'warehouse'])
-        
-        # Filtra SOLO prodotti con ESATTAMENTE "SMALLGIANTSAVAILABLE"
-        if physical_warehouse_col or virtual_warehouse_col:
-            initial_rows = len(df)
-            filter_mask = pd.Series([False] * len(df))
-            
-            if physical_warehouse_col:
-                # Match esatto su "SMALLGIANTSAVAILABLE" (trim spazi ma case sensitive)
-                physical_match = df[physical_warehouse_col].astype(str).str.strip() == 'SMALLGIANTSAVAILABLE'
-                filter_mask = filter_mask | physical_match
-                st.write(f"🔍 Prodotti con SMALLGIANTSAVAILABLE in magazzino fisico: {physical_match.sum()}")
-            
-            if virtual_warehouse_col:
-                virtual_match = df[virtual_warehouse_col].astype(str).str.strip() == 'SMALLGIANTSAVAILABLE'
-                filter_mask = filter_mask | virtual_match
-                st.write(f"🔍 Prodotti con SMALLGIANTSAVAILABLE in magazzino virtuale: {virtual_match.sum()}")
-            
-            df = df[filter_mask].copy()
-            filtered_count = initial_rows - len(df)
-            
-            if filtered_count > 0:
-                st.info(f"🔍 Esclusi {filtered_count} prodotti non-SMALLGIANTSAVAILABLE (selezionati {len(df)} prodotti)")
-            
-            if len(df) == 0:
-                st.error("❌ Nessun prodotto con esattamente 'SMALLGIANTSAVAILABLE' trovato nel file stock")
-                return pd.DataFrame()
-            
-            st.success(f"✅ Filtrati solo prodotti SMALLGIANTSAVAILABLE: {len(df)} prodotti")
-        else:
-            st.error("❌ Colonne 'Magazzino fisico' o 'Magazzino virtuale' non trovate. Impossibile filtrare.")
-            st.info("💡 Le colonne disponibili sono: " + str(list(df.columns)))
-            return pd.DataFrame()
-        
-        # Verifica che almeno SKU e una colonna quantità siano presenti
         if sku_column is None:
             st.error("❌ Colonna SKU non trovata nel file stock")
             return pd.DataFrame()
-        
         if available_column is None and in_stock_column is None:
             st.error("❌ Nessuna colonna quantità trovata nel file stock")
             return pd.DataFrame()
-        
-        st.success(f"✅ Colonne stock mappate:")
+
+        st.success("✅ Colonne stock mappate:")
         st.success(f"   • SKU: '{sku_column}'")
-        if available_column:
-            st.success(f"   • Disponibile: '{available_column}'")
-        if in_stock_column:
-            st.success(f"   • In Stock: '{in_stock_column}'")
-        if product_name_column:
-            st.success(f"   • Nome Prodotto: '{product_name_column}'")
-        if reserved_column:
-            st.success(f"   • Prenotate: '{reserved_column}'")
-        if incoming_column:
-            st.success(f"   • In Arrivo: '{incoming_column}'")
-        
-        # Crea il mapping delle colonne
+        if available_column: st.success(f"   • Disponibile: '{available_column}'")
+        if in_stock_column:  st.success(f"   • In Stock: '{in_stock_column}'")
+        if product_name_column: st.success(f"   • Nome Prodotto: '{product_name_column}'")
+        if reserved_column: st.success(f"   • Prenotate: '{reserved_column}'")
+        if incoming_column: st.success(f"   • In Arrivo: '{incoming_column}'")
+
         column_mapping = {sku_column: 'sku'}
-        
-        if available_column:
-            column_mapping[available_column] = 'qty_available'
-        if in_stock_column:
-            column_mapping[in_stock_column] = 'qty_in_stock'
-        if product_name_column:
-            column_mapping[product_name_column] = 'product_name'
-        if reserved_column:
-            column_mapping[reserved_column] = 'qty_reserved'
-        if incoming_column:
-            column_mapping[incoming_column] = 'qty_incoming'
-        
-        # Rinomina le colonne
+        if available_column:     column_mapping[available_column] = 'qty_available'
+        if in_stock_column:      column_mapping[in_stock_column] = 'qty_in_stock'
+        if product_name_column:  column_mapping[product_name_column] = 'product_name'
+        if reserved_column:      column_mapping[reserved_column] = 'qty_reserved'
+        if incoming_column:      column_mapping[incoming_column] = 'qty_incoming'
         df = df.rename(columns=column_mapping)
-        
-        # Converti le quantità in numerico
-        numeric_columns = ['qty_available', 'qty_in_stock', 'qty_reserved', 'qty_incoming']
-        for col in numeric_columns:
+
+        for col in ['qty_available','qty_in_stock','qty_reserved','qty_incoming']:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-        
-        # Calcola la quantità effettiva disponibile
+
+        # Calcolo stock effettivo evitando doppia sottrazione dei prenotati
+        available_is_net = False
         if 'qty_available' in df.columns:
-            df['current_stock'] = df['qty_available']
+            df['current_stock'] = df['qty_available']  # già netto
+            available_is_net = True
         elif 'qty_in_stock' in df.columns:
-            df['current_stock'] = df['qty_in_stock']
+            df['current_stock'] = df['qty_in_stock']   # lordo
         else:
             df['current_stock'] = 0
-        
-        # Sottrai le quantità prenotate se disponibili
-        if 'qty_reserved' in df.columns:
+
+        if 'qty_reserved' in df.columns and not available_is_net:
             df['current_stock'] = df['current_stock'] - df['qty_reserved']
-        
-        # Aggiungi le quantità in arrivo se disponibili
+
         if 'qty_incoming' in df.columns:
             df['current_stock'] = df['current_stock'] + df['qty_incoming']
-        
-        # Assicurati che non sia negativo
+
         df['current_stock'] = df['current_stock'].clip(lower=0)
-        
-        # Pulisci i dati
+
         df = df.dropna(subset=['sku'])
         df['sku'] = df['sku'].astype(str).str.strip()
-        
-        # NON aggregare duplicati - mantieni solo la prima occorrenza
+
         st.info("🔄 Rimuovendo prodotti duplicati (mantenendo prima occorrenza)...")
-        
         df_before = len(df)
         df = df.drop_duplicates(subset=['sku'], keep='first')
         df_after = len(df)
-        
         if df_before > df_after:
             st.success(f"✅ Rimossi {df_before - df_after} duplicati (da {df_before} a {df_after} righe)")
-        
-        
+
         st.success(f"✅ Stock processato: {len(df)} prodotti")
-        
-        return df[['sku', 'current_stock', 'product_name'] + [col for col in df.columns if col.startswith('qty_')]]
-        
+        keep_cols = ['sku','current_stock','product_name'] + [c for c in df.columns if c.startswith('qty_')]
+        keep_cols = [c for c in keep_cols if c in df.columns]
+        return df[keep_cols]
+
     except Exception as e:
         st.error(f"Errore nel processamento del file stock: {str(e)}")
         return pd.DataFrame()
 
 def process_excel_data(df):
     """
-    Processa il file Excel/CSV con le colonne specifiche per creare il formato richiesto
+    Ritorna result_df con colonne:
+    - date, sku, product_name, units_sold, units_sold_b2b, units_sold_b2c, on_hand_end
     """
     try:
-        # Debug: mostra le colonne trovate nel file
         st.write("🔍 **Colonne trovate nel file:**", list(df.columns))
-        
-        # Pulisci i nomi delle colonne (rimuovi spazi extra)
-        df.columns = df.columns.str.strip()
-        
-        # Se la prima colonna contiene il nome del file, probabilmente le intestazioni sono nella prima riga
+        df.columns = df.columns.astype(str).str.strip()
+
         if 'export' in str(df.columns[0]).lower() or 'unnamed' in str(df.columns[0]).lower():
             st.info("📋 Rilevate intestazioni nella prima riga. Riprocessando...")
-            # La prima riga contiene i veri nomi delle colonne
             df.columns = df.iloc[0]
             df = df[1:].reset_index(drop=True)
-            df.columns = df.columns.str.strip()
+            df.columns = df.columns.astype(str).str.strip()
             st.write("🔍 **Colonne corrette:**", list(df.columns))
-        
-        # Trova le colonne con ricerca più flessibile
+
         date_column = find_column(df, ['date', 'data', 'datetime', 'time', 'giorno'])
-        movement_column = find_column(df, ['movement', 'tipo', 'type', 'mov'])
-        sku_column = find_column(df, ['sku', 'internal', 'codice', 'code', 'item'])
+        movement_column = find_column(df, ['type', 'mov', 'movement', 'tipo'])
+        sku_column = find_column(df, ['internal sku', 'sku', 'codice', 'code', 'item'])
         quantity_column = find_column(df, ['quantity', 'quantit', 'qty', 'pezzi', 'qta'])
         name_column = find_column(df, ['name', 'nome', 'descrizione', 'description', 'product'])
-        
-        # Verifica che tutte le colonne necessarie siano state trovate
-        missing_columns = []
-        if date_column is None:
-            missing_columns.append("data/date")
-        if movement_column is None:
-            missing_columns.append("tipo movimento/type")
-        if sku_column is None:
-            missing_columns.append("SKU/codice")
-        if quantity_column is None:
-            missing_columns.append("quantità/quantity")
-        
-        if missing_columns:
-            st.error(f"❌ Colonne mancanti: {', '.join(missing_columns)}")
+        order_column = find_column(df, ['order number', 'order', 'ordine', 'order id', 'order_id', 'id ordine'])
+
+        missing = []
+        if date_column is None:      missing.append("data/date")
+        if movement_column is None:  missing.append("tipo/type")
+        if sku_column is None:       missing.append("SKU/codice")
+        if quantity_column is None:  missing.append("quantità/quantity")
+        if missing:
+            st.error(f"❌ Colonne mancanti: {', '.join(missing)}")
             st.error(f"Colonne disponibili: {list(df.columns)}")
             return pd.DataFrame()
-        
-        st.success(f"✅ Colonne mappate:")
+
+        st.success("✅ Colonne mappate:")
         st.success(f"   • Data: '{date_column}'")
         st.success(f"   • Movimento: '{movement_column}'")
         st.success(f"   • SKU: '{sku_column}'")
         st.success(f"   • Quantità: '{quantity_column}'")
-        if name_column:
-            st.success(f"   • Nome: '{name_column}'")
-        
-        # Rinomina le colonne per standardizzare
+        if name_column:  st.success(f"   • Nome: '{name_column}'")
+
         column_mapping = {
             date_column: 'Date',
             movement_column: 'Type',
             sku_column: 'Internal_SKU',
             quantity_column: 'Quantity'
         }
-        
-        if name_column:
-            column_mapping[name_column] = 'Name'
-        
+        if name_column:   column_mapping[name_column] = 'Name'
+        if order_column:  column_mapping[order_column] = 'Order_ID'
         df = df.rename(columns=column_mapping)
-        
-        # Converti la data con più flessibilità
+
         df['Date'] = pd.to_datetime(df['Date'], errors='coerce', dayfirst=True)
-        
-        # Rimuovi righe con date non valide
-        initial_rows = len(df)
         df = df.dropna(subset=['Date'])
-        
-        if len(df) == 0:
-            st.error("❌ Nessuna data valida trovata nel file")
-            return pd.DataFrame()
-        
-        if len(df) < initial_rows:
-            st.warning(f"⚠️ {initial_rows - len(df)} righe con date non valide sono state rimosse")
-        
-        st.success(f"✅ Processate {len(df)} righe con date valide")
-        
-        # Converti quantità in numerico
+
+        # Channel B2B/B2C
+        channel_available = False
+        if 'Order_ID' in df.columns:
+            df['Order_ID'] = df['Order_ID'].astype(str)
+            df['Channel'] = df['Order_ID'].apply(lambda x: 'B2C' if str(x).strip().isdigit() else 'B2B')
+            channel_available = True
+            st.write("📊 Distribuzione ordini B2B/B2C:")
+            ch = df['Channel'].value_counts()
+            st.write(f"   • B2B: {ch.get('B2B', 0)} ordini")
+            st.write(f"   • B2C: {ch.get('B2C', 0)} ordini")
+
         df['Quantity'] = pd.to_numeric(df['Quantity'], errors='coerce')
         df = df.dropna(subset=['Quantity'])
-        
-        # Pulisci i valori della colonna Type
         df['Type'] = df['Type'].astype(str).str.lower().str.strip()
-        
-        # Debug: mostra i tipi di movimento unici
+
         st.write("🔍 **Tipi di movimento trovati:**", df['Type'].unique())
-        
-        # Filtra solo i movimenti di uscita (vendite) con più flessibilità
-        sales_keywords = ['uscita', 'out', 'vendita', 'sale', 'sold', 'exit', 'ship']
-        sales_condition = df['Type'].str.contains('|'.join(sales_keywords), na=False)
+
+        subtype_column = find_column(df, ['subtype', 'sub type', 'sub-type', 'sottotipo'])
+        warehouse_column = find_column(df, ['warehouse', 'magazzino', 'deposito', 'wms'])
+
+        st.write("🔍 Colonne trovate per filtri addizionali:")
+        if subtype_column:   st.write(f"   • SubType: '{subtype_column}'")
+        if warehouse_column: st.write(f"   • Warehouse: '{warehouse_column}'")
+
+        sales_condition = df['Type'].str.lower().str.strip() == 'out'
+        if subtype_column:
+            sales_condition &= (df[subtype_column].astype(str).str.lower().str.strip() != 'inventory')
+        if warehouse_column:
+            sales_condition &= (df[warehouse_column].astype(str).str.strip() == 'SMALLGIANTSAVAILABLE')
+
+        total_rows = len(df)
         sales_data = df[sales_condition]
-        
+        st.write("📊 Filtri applicati:")
+        st.write(f"   • Righe totali: {total_rows}")
+        st.write(f"   • Righe dopo filtro Type='out': {len(df[df['Type'].str.lower().str.strip() == 'out'])}")
+        if subtype_column:
+            st.write(f"   • Righe dopo esclusione inventory: {len(df[(df['Type'].str.lower().str.strip() == 'out') & (df[subtype_column].astype(str).str.lower().str.strip() != 'inventory')])}")
+        if warehouse_column:
+            st.write(f"   • Righe finali dopo filtro SMALLGIANTSAVAILABLE: {len(sales_data)}")
+
         st.write(f"📊 **Dati di vendita trovati:** {len(sales_data)} righe")
-        
         if len(sales_data) == 0:
             st.warning("⚠️ Nessun movimento di vendita trovato. Verifica i valori nella colonna Type.")
-            st.write("Provo ad utilizzare tutti i movimenti...")
             sales_data = df.copy()
-        
-        # Calcola lo stock finale per ogni prodotto
+
+        # Costruzione timeline
         stock_data = []
-        unique_skus = df['Internal_SKU'].dropna().unique()
-        
-        for sku in unique_skus:
-            sku_data = df[df['Internal_SKU'] == sku].copy()
-            sku_data = sku_data.sort_values('Date')
-            
-            # Calcola stock cumulativo
+        for sku in df['Internal_SKU'].dropna().unique():
+            sku_data = df[df['Internal_SKU'] == sku].copy().sort_values('Date')
             stock_balance = 0
-            
             for _, row in sku_data.iterrows():
                 movement_type = str(row['Type']).lower()
                 quantity = row['Quantity']
-                
-                # Identifica se è entrata o uscita
-                if any(keyword in movement_type for keyword in ['entrata', 'in', 'receipt', 'receive', 'carico']):
-                    stock_balance += quantity
-                    units_sold = 0
-                elif any(keyword in movement_type for keyword in sales_keywords):
+                if movement_type == 'out':
                     stock_balance -= quantity
                     units_sold = quantity
-                else:
-                    # Default: considera come uscita se positivo, entrata se negativo
-                    if quantity > 0:
-                        stock_balance -= quantity
-                        units_sold = quantity
+                    # split canale: B2C se Order_ID è tutto numerico; B2B = Totale - B2C
+                    if channel_available:
+                        units_b2c = quantity if str(row.get('Channel')) == 'B2C' else 0
                     else:
-                        stock_balance += abs(quantity)
-                        units_sold = 0
-                
-                # Ottieni il nome del prodotto
+                        units_b2c = 0
+                    units_b2b = max(0, quantity - units_b2c)
+                else:
+                    stock_balance += quantity
+                    units_sold = 0
+                    units_b2b = 0
+                    units_b2c = 0
+
                 product_name = row.get('Name', f'Prodotto {sku}')
-                
                 stock_data.append({
                     'date': row['Date'],
                     'sku': str(sku),
                     'product_name': product_name,
                     'units_sold': units_sold,
+                    'units_sold_b2b': units_b2b,
+                    'units_sold_b2c': units_b2c,
                     'on_hand_end': max(0, stock_balance)
                 })
-        
-        # Converti in DataFrame
+
         result_df = pd.DataFrame(stock_data)
-        
         if result_df.empty:
             st.error("❌ Nessun dato processabile trovato")
             return pd.DataFrame()
-        
-        # Raggruppa per data e SKU per evitare duplicati
-        result_df = result_df.groupby(['date', 'sku', 'product_name']).agg({
+
+        # Aggrega per giorno/SKU
+        agg_cols = {
             'units_sold': 'sum',
+            'units_sold_b2b': 'sum',
+            'units_sold_b2c': 'sum',
             'on_hand_end': 'last'
-        }).reset_index()
-        
+        }
+        result_df = result_df.groupby(['date','sku','product_name']).agg(agg_cols).reset_index()
         st.success(f"✅ Dati processati: {len(result_df)} record per {result_df['sku'].nunique()} prodotti")
-        
         return result_df
-        
+
     except Exception as e:
         st.error(f"Errore nel processamento dei dati: {str(e)}")
-        st.error("Stack trace per debug:")
         import traceback
         st.code(traceback.format_exc())
         return pd.DataFrame()
 
 def simple_forecast(ts_data, periods):
-    """
-    Modello di forecasting semplificato se Prophet non è disponibile
-    """
     if len(ts_data) < 2:
-        # Se abbiamo pochi dati, usa la media
         avg_value = ts_data.mean() if len(ts_data) > 0 else 1
-        
         forecast_data = []
         last_date = ts_data.index[-1] if len(ts_data) > 0 else datetime.now()
-        
         for i in range(1, periods + 1):
             forecast_date = last_date + timedelta(days=i)
             forecast_data.append({
@@ -510,542 +422,379 @@ def simple_forecast(ts_data, periods):
                 'yhat_lower': max(0, avg_value * 0.7),
                 'yhat_upper': avg_value * 1.3
             })
-        
         return pd.DataFrame(forecast_data)
-    
-    # Calcola trend e stagionalità
+
     x = np.arange(len(ts_data))
     y = ts_data.values
-    
-    # Regressione lineare per il trend
     z = np.polyfit(x, y, 1)
     trend_slope = z[0]
-    
-    # Media mobile per ridurre il rumore
+
     if len(y) >= 7:
         y_smooth = pd.Series(y).rolling(window=7, min_periods=1).mean().values
     else:
         y_smooth = y
-    
     last_value = y_smooth[-1]
-    
-    # Calcola stagionalità settimanale se abbiamo abbastanza dati
+
     weekly_pattern = np.ones(7)
     if len(ts_data) >= 14:
         for day in range(7):
             day_values = [y[i] for i in range(len(y)) if i % 7 == day]
             if day_values:
                 weekly_pattern[day] = np.mean(day_values) / np.mean(y)
-    
-    # Genera previsioni
+
     forecast_data = []
     last_date = ts_data.index[-1]
-    
     for i in range(1, periods + 1):
         forecast_date = last_date + timedelta(days=i)
-        
-        # Trend base
         base_value = last_value + trend_slope * i
-        
-        # Applica stagionalità settimanale
         day_of_week = (forecast_date.weekday()) % 7
         seasonal_factor = weekly_pattern[day_of_week]
-        forecast_value = base_value * seasonal_factor
-        
-        # Assicurati che non sia negativo
-        forecast_value = max(0, forecast_value)
-        
-        # Calcola intervalli di confidenza
+        forecast_value = max(0, base_value * seasonal_factor)
         std_dev = np.std(y) if len(y) > 1 else forecast_value * 0.2
-        
         forecast_data.append({
             'ds': forecast_date,
             'yhat': forecast_value,
             'yhat_lower': max(0, forecast_value - 1.96 * std_dev),
             'yhat_upper': forecast_value + 1.96 * std_dev
         })
-    
     return pd.DataFrame(forecast_data)
 
+# --- OOS, pesi e stagionalità: RESAMPLE GIORNALIERO ---
 def mark_out_of_stock_days(daily_series, min_run_days=14):
-    """
-    Restituisce una pd.Series booleana (stesso indice di daily_series)
-    True se quel giorno è parte di una run di almeno `min_run_days`
-    giorni consecutivi con vendite == 0.
-    """
     s = daily_series.copy().sort_index()
-    s = s.asfreq('D', fill_value=0)
+    if not isinstance(s.index, pd.DatetimeIndex):
+        s.index = pd.to_datetime(s.index)
+    s = s.resample('D').sum().fillna(0)
 
     zero = (s == 0)
-    # id di cambio run
     run_id = (zero != zero.shift()).cumsum()
-    # lunghezza di ciascuna run
     run_length = zero.groupby(run_id).transform('sum')
     oos = zero & (run_length >= min_run_days)
     oos.index = s.index
     return oos
 
 def calculate_monthly_average_excluding_oos(daily_series, min_run_days=14, min_weight=0.2):
-    """
-    Calcola la media mensile delle vendite con ponderazione per mesi con OOS parziale.
-    APPROCCIO: prima aggrega le vendite per mese, poi calcola la media ponderata.
-    """
     try:
-        # Prepara la serie giornaliera
-        s = daily_series.copy().sort_index()
-        
-        # Converti in frequenza giornaliera riempiendo i buchi
-        s = s.asfreq('D', fill_value=0)
-        
-        # Identifica giorni OOS (run di almeno min_run_days con vendite=0)
-        oos_days = mark_out_of_stock_days(s, min_run_days=min_run_days)
-        
-        # Raggruppa per anno-mese
-        monthly_data = []
-        
-        # Per ogni mese nel periodo
-        for month_period in s.index.to_period('M').unique():
-            # Seleziona i giorni di questo mese
-            mask = (s.index.to_period('M') == month_period)
-            month_series = s[mask]
-            month_oos_series = oos_days[mask]
-            
-            # Conta giorni
-            total_days = len(month_series)
-            oos_days_count = int(month_oos_series.sum())
-            valid_days_count = total_days - oos_days_count
-            
-            # IMPORTANTE: somma le vendite di TUTTO il mese (inclusi giorni con 0 vendite non-OOS)
-            # Questo è corretto perché vogliamo la performance mensile reale
-            month_total_sales = float(month_series.sum())
-            
-            # Determina il peso del mese
-            if oos_days_count >= total_days:
-                # Mese completamente OOS: escludi completamente
-                weight = 0.0
-            elif oos_days_count == 0:
-                # Nessun giorno OOS: peso pieno
-                weight = 1.0
-            else:
-                # OOS parziale: peso proporzionale
-                # min_weight assicura che mesi parzialmente OOS abbiano comunque un peso minimo
-                weight = max(min_weight, valid_days_count / total_days)
-            
-            monthly_data.append({
-                'month': month_period,
-                'year': month_period.year,
-                'month_num': month_period.month,
-                'sales': month_total_sales,
-                'weight': weight,
-                'total_days': total_days,
-                'valid_days': valid_days_count,
-                'oos_days': oos_days_count
-            })
-        
-        # Converti in DataFrame per analisi
-        df_months = pd.DataFrame(monthly_data)
-        
-        # Filtra solo mesi con peso > 0 (escludi mesi completamente OOS)
-        df_valid = df_months[df_months['weight'] > 0].copy()
-        
-        if len(df_valid) == 0:
-            return {
-                'monthly_avg': 0,
-                'monthly_avg_simple': 0,
-                'total_sales': 0,
-                'valid_months': 0,
-                'total_months': len(df_months),
-                'oos_months': len(df_months[df_months['weight'] == 0]),
-                'weighted_months': 0,
-                'first_sale_date': None,
-                'last_sale_date': None
-            }
-        
-        # CALCOLO 1: Media ponderata (tiene conto dei mesi parzialmente OOS)
-        total_weighted_sales = (df_valid['sales'] * df_valid['weight']).sum()
-        total_weight = df_valid['weight'].sum()
-        monthly_avg_weighted = total_weighted_sales / total_weight if total_weight > 0 else 0
-        
-        # CALCOLO 2: Media semplice (per confronto/debug)
-        monthly_avg_simple = df_valid['sales'].mean()
-        
-        # Statistiche
-        total_sales = float(df_valid['sales'].sum())
-        valid_months = len(df_valid)
-        total_months = len(df_months)
-        oos_months = len(df_months[df_months['weight'] == 0])
-        weighted_months = float(total_weight)
-        
-        # Date primo/ultimo movimento
-        first_sale = s[s > 0].index.min() if (s > 0).any() else s.index.min()
-        last_sale = s[s > 0].index.max() if (s > 0).any() else s.index.max()
-        
-        return {
-            'monthly_avg': monthly_avg_weighted,
-            'monthly_avg_simple': monthly_avg_simple,
-            'total_sales': total_sales,
-            'valid_months': valid_months,
-            'total_months': total_months,
-            'oos_months': oos_months,
-            'weighted_months': weighted_months,
-            'first_sale_date': first_sale,
-            'last_sale_date': last_sale,
-            'monthly_breakdown': df_months.to_dict('records')  # Per debug dettagliato
-        }
-        
-    except Exception as e:
-        import traceback
-        return {
-            'monthly_avg': 0,
-            'monthly_avg_simple': 0,
-            'total_sales': 0,
-            'valid_months': 0,
-            'total_months': 0,
-            'oos_months': 0,
-            'weighted_months': 0,
-            'first_sale_date': None,
-            'last_sale_date': None,
-            'error': str(e),
-            'traceback': traceback.format_exc()
-        }
-    
-def compute_oos_month_weights(daily_series, min_run_days=14, min_weight=0.2):
-    """
-    Ritorna un dict {Period('YYYY-MM'): weight} con il peso di ogni mese.
-    - Se il mese è completamente OOS -> weight = 0 (escludi)
-    - Se il mese ha OOS days ma non completamente -> weight = max(min_weight, 1 - O_days/total_days)
-    - Se nessun OOS day -> weight = 1
-    """
-    s = daily_series.copy().asfreq('D', fill_value=0).fillna(0)
-    oos_days_series = mark_out_of_stock_days(s, min_run_days=min_run_days)
+        if not isinstance(daily_series.index, pd.DatetimeIndex):
+            daily_series.index = pd.to_datetime(daily_series.index)
+        s = daily_series.copy().sort_index().resample('D').sum().fillna(0)
 
+        today = datetime.now()
+        start_of_current_month = datetime(today.year, today.month, 1)
+        s = s[s.index < start_of_current_month]
+
+        if s.empty:
+            return {'monthly_avg':0.0,'monthly_avg_simple':0.0,'total_sales':0.0,
+                    'valid_months':0,'total_months':0,'oos_months':0,
+                    'weighted_months':0.0,'first_sale_date':None,'last_sale_date':None,
+                    'monthly_breakdown':[]}
+
+        oos_days = mark_out_of_stock_days(s, min_run_days=min_run_days)
+
+        rows = []
+        for m in s.index.to_period('M').unique():
+            idx = (s.index.to_period('M') == m)
+            total = int(idx.sum())
+            oos_cnt = int(oos_days[idx].sum())
+            valid = total - oos_cnt
+            sales_non_oos = float(s[idx][~oos_days[idx]].sum())
+            proj = (sales_non_oos/valid*30.0) if valid>0 else 0.0
+            if oos_cnt >= total:
+                w = 0.0
+            elif oos_cnt == 0:
+                w = 1.0
+            else:
+                w = max(min_weight, 1.0 - oos_cnt/total)
+            rows.append({'year': m.year, 'month_num': m.month, 'month': m,
+                         'sales': proj, 'actual_sales': sales_non_oos,
+                         'oos_days': oos_cnt, 'valid_days': valid,
+                         'total_days': total, 'weight': w})
+
+        dfm = pd.DataFrame(rows)
+        total_months = len(dfm)
+        oos_months = int((dfm['valid_days']==0).sum())
+        valid_df = dfm[dfm['valid_days']>0].copy()
+
+        if valid_df.empty:
+            by_month = s.groupby(s.index.to_period('M')).sum()
+            monthly_avg_simple = float((by_month[by_month>0]).mean()) if (by_month>0).any() else 0.0
+            return {'monthly_avg': monthly_avg_simple, 'monthly_avg_simple': monthly_avg_simple,
+                    'total_sales': float(s.sum()), 'valid_months': 0, 'total_months': total_months,
+                    'oos_months': oos_months, 'weighted_months': 0.0,
+                    'first_sale_date': s[s>0].index.min() if (s>0).any() else None,
+                    'last_sale_date': s[s>0].index.max() if (s>0).any() else None,
+                    'monthly_breakdown': dfm.to_dict('records')}
+
+        monthly_avg = float(valid_df['sales'].mean())
+        tot_sales_valid = float(valid_df['actual_sales'].sum())
+        weighted_months = float(valid_df['weight'].sum())
+
+        first_sale = s[s>0].index.min() if (s>0).any() else s.index.min()
+        last_sale = s[s>0].index.max() if (s>0).any() else s.index.max()
+
+        return {'monthly_avg': monthly_avg, 'monthly_avg_simple': monthly_avg,
+                'total_sales': tot_sales_valid, 'valid_months': int(len(valid_df)),
+                'total_months': total_months, 'oos_months': oos_months,
+                'weighted_months': weighted_months, 'first_sale_date': first_sale,
+                'last_sale_date': last_sale, 'monthly_breakdown': dfm.to_dict('records')}
+    except Exception:
+        return {'monthly_avg':0.0,'monthly_avg_simple':0.0,'total_sales':0.0,
+                'valid_months':0,'total_months':0,'oos_months':0,
+                'weighted_months':0.0,'first_sale_date':None,'last_sale_date':None,
+                'monthly_breakdown':[]}
+
+def compute_oos_month_weights(daily_series, min_run_days=14, min_weight=0.2):
+    s = daily_series.copy()
+    if not isinstance(s.index, pd.DatetimeIndex):
+        s.index = pd.to_datetime(s.index)
+    s = s.sort_index().resample('D').sum().fillna(0)
+    oos_days_series = mark_out_of_stock_days(s, min_run_days=min_run_days)
     weights = {}
-    months = s.index.to_period('M').unique()
-    for m in months:
+    for m in s.index.to_period('M').unique():
         mask = (s.index.to_period('M') == m)
-        if mask.sum() == 0:
-            continue
         total_days = int(mask.sum())
         oos_count = int(oos_days_series[mask].sum())
-        if oos_count == 0:
-            w = 1.0
-        elif oos_count >= total_days:
-            w = 0.0
-        else:
-            w = max(min_weight, 1.0 - (oos_count / total_days))
+        if oos_count == 0:         w = 1.0
+        elif oos_count >= total_days: w = 0.0
+        else:                      w = max(min_weight, 1.0 - (oos_count / total_days))
         weights[m] = float(w)
     return weights
 
-def calculate_monthly_seasonality(all_products_data, daily_series_for_weights=None, min_run_days=14, min_weight=0.2):
-    """
-    Calcola fattori stagionali mensili {1..12: factor} usando media pesata dei mesi.
-    - all_products_data: DataFrame con index datetime e colonna 'units_sold'
-    - daily_series_for_weights: serie giornaliera del prodotto (opzionale) usata per calcolare pesi OOS
-    """
-    try:
-        a = all_products_data.copy()
-        # Assicuriamoci indice datetime
-        if 'date' in a.columns:
-            a = a.set_index('date')
-        a.index = pd.to_datetime(a.index)
+def calculate_monthly_seasonality(all_products_data, single_product_data=None, daily_series_for_weights=None, min_run_days=14, min_weight=0.2):
+    def _calc_seasonality(data, weights=None):
+        try:
+            a = data.copy()
+            if 'date' in a.columns:
+                a = a.set_index('date')
+            a.index = pd.to_datetime(a.index)
 
-        # Calcola vendite mensili (per anno, mese)
-        monthly_by_year = a.groupby([a.index.year, a.index.month])['units_sold'].sum().reset_index()
-        monthly_by_year.columns = ['year', 'month', 'units_sold']
-        if monthly_by_year.empty:
+            monthly_by_year = a.groupby([a.index.year, a.index.month])['units_sold'].sum().reset_index()
+            monthly_by_year.columns = ['year', 'month', 'units_sold']
+            if monthly_by_year.empty:
+                return {i: 1.0 for i in range(1, 13)}
+
+            monthly_by_year['period'] = monthly_by_year.apply(
+                lambda r: pd.Period(year=int(r['year']), month=int(r['month']), freq='M'), axis=1)
+
+            if weights is None:
+                if daily_series_for_weights is not None:
+                    weights = compute_oos_month_weights(daily_series_for_weights, min_run_days=min_run_days, min_weight=min_weight)
+                else:
+                    daily_from_data = a['units_sold'].groupby(a.index).sum()
+                    weights = compute_oos_month_weights(daily_from_data, min_run_days=min_run_days, min_weight=min_weight)
+
+            monthly_by_year['weight'] = monthly_by_year['period'].map(weights).fillna(1.0)
+            monthly_by_year = monthly_by_year[monthly_by_year['weight'] > 0]
+            if monthly_by_year.empty:
+                return {i: 1.0 for i in range(1, 13)}
+
+            def weighted_avg(group):
+                w = group['weight']
+                vals = group['units_sold']
+                return (vals * w).sum() / w.sum()
+
+            monthly_avg = monthly_by_year.groupby('month').apply(weighted_avg)
+            overall_avg = monthly_avg.mean()
+            seasonal_factors = (monthly_avg / overall_avg).to_dict()
+            for m in range(1, 13):
+                if m not in seasonal_factors or not np.isfinite(seasonal_factors[m]):
+                    seasonal_factors[m] = 1.0
+            return seasonal_factors
+        except Exception:
             return {i: 1.0 for i in range(1, 13)}
 
-        # costruisci Period per ciascuna riga
-        monthly_by_year['period'] = monthly_by_year.apply(
-            lambda r: pd.Period(year=int(r['year']), month=int(r['month']), freq='M'), axis=1)
+    global_seasonality = _calc_seasonality(all_products_data)
+    product_seasonality = {i: 1.0 for i in range(1, 13)}
+    if single_product_data is not None and len(single_product_data) >= 12:
+        product_seasonality = _calc_seasonality(single_product_data, weights=compute_oos_month_weights(daily_series_for_weights) if daily_series_for_weights is not None else None)
 
-        # calcoliamo i pesi: preferiamo usare la serie del prodotto se fornita
-        if daily_series_for_weights is not None:
-            weights_map = compute_oos_month_weights(daily_series_for_weights, min_run_days=min_run_days, min_weight=min_weight)
-        else:
-            daily_from_all = a['units_sold'].groupby(a.index).sum()
-            weights_map = compute_oos_month_weights(daily_from_all, min_run_days=min_run_days, min_weight=min_weight)
+    final_seasonality = {m: max(global_seasonality.get(m,1.0), product_seasonality.get(m,1.0)) for m in range(1,13)}
+    return final_seasonality
 
-        # assegna il peso a ogni riga
-        monthly_by_year['weight'] = monthly_by_year['period'].map(weights_map).fillna(1.0)
+def calculate_growth_rate(ts_data, all_products_data=None, months_to_compare=3):
+    st.write("🔄 Calcolo tasso di crescita:")
+    st.write(f"   • Mesi da confrontare: {months_to_compare}")
+    st.write(f"   • Dati disponibili: da {ts_data.index.min()} a {ts_data.index.max()}")
+    st.write(f"   • Totale uscite nel periodo: {ts_data.sum():.1f}")
 
-        # escludi i mesi con peso 0 (completamente OOS)
-        monthly_by_year = monthly_by_year[monthly_by_year['weight'] > 0]
+    today = datetime.now()
+    last_complete_month = datetime(today.year, today.month, 1) - timedelta(days=1)
+    last_complete_month = last_complete_month.replace(day=1)
+    st.write(f"   • Ultimo mese completo considerato: {last_complete_month.strftime('%Y-%m')}")
 
-        if monthly_by_year.empty:
-            return {i: 1.0 for i in range(1, 13)}
+    def _calc_growth(data_series):
+        try:
+            if len(data_series) < 30:
+                return 0.0
+            data_series = data_series[data_series.index < last_complete_month]
+            if data_series.empty:
+                return 0.0
+            data_df = data_series.reset_index()
+            data_df.columns = ['date','sales']
+            data_df['month'] = data_df['date'].dt.month
+            data_df['year'] = data_df['date'].dt.year
+            monthly_sales = data_df.groupby(['year','month'])['sales'].sum().reset_index()
+            monthly_sales['ym'] = pd.to_datetime(monthly_sales['year'].astype(str)+'-'+monthly_sales['month'].astype(str).str.zfill(2))
+            monthly_sales = monthly_sales.sort_values('ym')
 
-        # calcola media pesata per ogni mese numerico (1..12)
-        def weighted_avg(group):
-            w = group['weight']
-            vals = group['units_sold']
-            return (vals * w).sum() / w.sum()
+            if len(monthly_sales) < 2:
+                return 0.0
+            recent_months = monthly_sales.tail(months_to_compare)
 
-        monthly_avg = monthly_by_year.groupby('month').apply(weighted_avg)
-        overall_avg = monthly_avg.mean()
+            growth_rates = []
+            for _, row in recent_months.iterrows():
+                year = row['year']; month = row['month']
+                current_sales = row['sales']; current_date = row['ym']
+                previous_year = monthly_sales[(monthly_sales['year']==year-1)&(monthly_sales['month']==month)]
+                if not previous_year.empty:
+                    prev_sales = previous_year['sales'].iloc[0]
+                    if prev_sales > 0:
+                        growth = (current_sales - prev_sales) / prev_sales
+                        growth_rates.append(growth)
+                        st.write(f"   📈 {current_date.strftime('%Y-%m')}: {current_sales:.1f} vs {prev_sales:.1f} anno prec. → crescita {growth*100:.1f}%")
+                else:
+                    six_months_ago = current_date - pd.DateOffset(months=7)
+                    prev_6_months = monthly_sales[(monthly_sales['ym'] > six_months_ago) & (monthly_sales['ym'] < current_date - pd.DateOffset(months=1))]
+                    st.write(f"   ℹ️ {current_date.strftime('%Y-%m')}: nessun dato anno precedente, uso media 6 mesi precedenti")
+                    if not prev_6_months.empty:
+                        avg_prev_sales = prev_6_months['sales'].mean()
+                        if avg_prev_sales > 0:
+                            growth = (current_sales - avg_prev_sales) / avg_prev_sales
+                            growth_rates.append(growth)
 
-        seasonal_factors = (monthly_avg / overall_avg).to_dict()
-
-        # assicura tutti i mesi
-        for m in range(1, 13):
-            if m not in seasonal_factors or not np.isfinite(seasonal_factors[m]):
-                seasonal_factors[m] = 1.0
-
-        return seasonal_factors
-    except Exception:
-        return {i: 1.0 for i in range(1, 13)}
-
-def calculate_growth_rate(ts_data, months_to_compare=3):
-    """
-    Calcola il tasso di crescita confrontando gli ultimi mesi con gli stessi mesi dell'anno precedente
-    """
-    try:
-        if len(ts_data) < 30:  # Almeno un mese di dati
+            if growth_rates:
+                avg_growth = float(np.mean(growth_rates))
+                st.write(f"   📊 Media crescita su {len(growth_rates)} mesi: {avg_growth*100:.1f}%")
+                return avg_growth
+            st.write("   ⚠️ Nessun dato di crescita calcolabile")
             return 0.0
-        
-        data_df = ts_data.reset_index()
-        data_df.columns = ['date', 'sales']
-        data_df['month'] = data_df['date'].dt.month
-        data_df['year'] = data_df['date'].dt.year
-        
-        # Raggruppa per anno e mese
-        monthly_sales = data_df.groupby(['year', 'month'])['sales'].sum().reset_index()
-        
-        if len(monthly_sales) < 2:
+        except Exception as e:
+            st.error(f"Errore nel calcolo crescita: {str(e)}")
             return 0.0
-        
-        # Ultimi mesi disponibili
-        recent_months = monthly_sales.tail(months_to_compare)
-        
-        growth_rates = []
-        for _, row in recent_months.iterrows():
-            year = row['year']
-            month = row['month']
-            current_sales = row['sales']
-            
-            # Cerca stesso mese anno precedente
-            previous_year = monthly_sales[(monthly_sales['year'] == year - 1) & 
-                                         (monthly_sales['month'] == month)]
-            
-            if not previous_year.empty:
-                prev_sales = previous_year['sales'].iloc[0]
-                if prev_sales > 0:
-                    growth = (current_sales - prev_sales) / prev_sales
-                    growth_rates.append(growth)
-        
-        if growth_rates:
-            return np.mean(growth_rates)
-        return 0.0
-    except:
-        return 0.0
+
+    product_growth = _calc_growth(ts_data)
+
+    global_growth = 0.0
+    if all_products_data is not None:
+        if isinstance(all_products_data, pd.DataFrame):
+            if 'units_sold' in all_products_data.columns:
+                st.write("📈 Calcolo crescita globale:")
+                all_products_series = all_products_data.groupby(all_products_data.index)['units_sold'].sum()
+                global_growth = _calc_growth(all_products_series)
+
+    max_growth = max(product_growth, global_growth)
+    st.write("🎯 Riepilogo crescita:")
+    st.write(f"   • Prodotto: {product_growth*100:.1f}%")
+    st.write(f"   • Globale: {global_growth*100:.1f}%")
+    st.write(f"   • Scelto: {max_growth*100:.1f}%")
+    return max_growth
 
 def forecast_with_monthly_seasonality(data, periods, all_products_data=None, current_sku=None):
-    """
-    Previsione basata su stagionalità mensile e crescita storica
-    """
     if len(data) < 2:
         return simple_forecast(data, periods)
-    
     try:
         data_df = data.reset_index()
-        data_df.columns = ['date', 'sales']
+        data_df.columns = ['date','sales']
         data_df['month'] = data_df['date'].dt.month
         data_df['year'] = data_df['date'].dt.year
-        
         last_date = data_df['date'].max()
-        
-        # Calcola vendite mensili per questo prodotto
-        monthly_sales = data_df.groupby(['year', 'month'])['sales'].sum().reset_index()
-        
-        # Calcola tasso di crescita
+
+        monthly_sales = data_df.groupby(['year','month'])['sales'].sum().reset_index()
         growth_rate = calculate_growth_rate(data, months_to_compare=3)
         st.info(f"📈 Tasso di crescita rilevato: {growth_rate*100:.1f}%")
-        
-        # Ottieni stagionalità mensile
-        if all_products_data is not None and len(all_products_data) > len(data) * 2:
-            seasonal_factors = calculate_monthly_seasonality(all_products_data, current_sku)
-            st.info("🌍 Usando stagionalità da tutti i prodotti")
-        else:
-            # Calcola stagionalità solo da questo prodotto
-            if len(monthly_sales) >= 12:
-                monthly_avg = monthly_sales.groupby('month')['sales'].mean()
-                overall_avg = monthly_avg.mean()
-                seasonal_factors = (monthly_avg / overall_avg).to_dict()
-                st.info("📊 Usando stagionalità del prodotto specifico")
-            else:
-                seasonal_factors = {i: 1.0 for i in range(1, 13)}
-                st.warning("⚠️ Dati insufficienti per stagionalità, uso andamento recente")
 
-                # ---------------------------
-        # CALCOLO PESI OOS E STAGIONALITA'
-        # ---------------------------
-        # Prepara la serie giornaliera 'data' per i pesi (daily_series)
-        daily_series_for_weights = data.copy().sort_index().asfreq('D', fill_value=0).fillna(0)
-
-        # Month weights per il prodotto (Period -> weight)
+        daily_series_for_weights = data.copy().sort_index().resample('D').sum().fillna(0)
         month_weights = compute_oos_month_weights(daily_series_for_weights, min_run_days=14, min_weight=0.2)
 
-        # Calcola i seasonal_factors usando i pesi (passiamo daily_series_for_weights così la funzione userà i pesi del prodotto)
-        seasonal_factors = calculate_monthly_seasonality(all_products_data if all_products_data is not None else data.to_frame(name='units_sold'),
+        if all_products_data is None:
+            all_products_data = data.to_frame(name='units_sold')
+        seasonal_factors = calculate_monthly_seasonality(all_products_data,
                                                          daily_series_for_weights=daily_series_for_weights,
                                                          min_run_days=14, min_weight=0.2)
 
-        # Precalcola recent_avg (fallback) una volta per efficienza
         recent_avg = float(data.tail(30).mean()) if len(data) >= 30 else float(data.mean()) if len(data) > 0 else 0.0
-        # ---------------------------
 
-        
-        # Genera previsioni
         forecast_data = []
-        
         for i in range(1, periods + 1):
             forecast_date = last_date + timedelta(days=i)
             forecast_month = forecast_date.month
             forecast_year = forecast_date.year
-            
-            # Cerca vendite stesso mese anno precedente
-            same_month_last_year = monthly_sales[
-                (monthly_sales['year'] == forecast_year - 1) & 
-                (monthly_sales['month'] == forecast_month)
-            ]
-            
-                        # calcolo period per il mese dell'anno precedente
+            same_month_last_year = monthly_sales[(monthly_sales['year']==forecast_year-1)&(monthly_sales['month']==forecast_month)]
             period_prev_year = pd.Period(year=forecast_year-1, month=forecast_month, freq='M')
 
             if not same_month_last_year.empty:
                 base_monthly_sales = float(same_month_last_year['sales'].iloc[0])
                 adjusted_monthly_sales = base_monthly_sales * (1 + growth_rate)
-                # giorni del mese forecast_year/forecast_month
                 days_in_month = calendar.monthrange(forecast_year, forecast_month)[1]
-
-                # recupera peso per il mese specifico (se non disponibile assume 1.0)
                 month_weight = month_weights.get(period_prev_year, 1.0)
-
                 if month_weight == 0.0:
-                    # completamente OOS: fallback su recente con stagionalità
                     seasonal_factor = seasonal_factors.get(forecast_month, 1.0)
                     base_value = recent_avg * seasonal_factor * (1 + growth_rate * 0.5)
                 elif month_weight < 1.0:
-                    # mix tra valore anno precedente (pesato) e stima recente (meno affidabile)
                     val_from_lastyear = adjusted_monthly_sales / days_in_month
                     val_from_recent = recent_avg * seasonal_factors.get(forecast_month, 1.0) * (1 + growth_rate * 0.5)
                     base_value = month_weight * val_from_lastyear + (1.0 - month_weight) * val_from_recent
                 else:
-                    # peso pieno (1.0): uso il valore dell'anno precedente
                     base_value = adjusted_monthly_sales / days_in_month
             else:
-                # non abbiamo dati per questo mese dell'anno scorso: usa recent_avg * seasonal
                 seasonal_factor = seasonal_factors.get(forecast_month, 1.0)
                 base_value = recent_avg * seasonal_factor * (1 + growth_rate * 0.5)
-            
-            # Assicurati non sia negativo
+
             forecast_value = max(0, base_value)
-            
-            # Calcola intervalli di confidenza
             std_dev = data.std() if len(data) > 1 else forecast_value * 0.3
-            
             forecast_data.append({
                 'ds': forecast_date,
                 'yhat': forecast_value,
                 'yhat_lower': max(0, forecast_value - 1.5 * std_dev),
                 'yhat_upper': forecast_value + 1.5 * std_dev
             })
-        
-        return pd.DataFrame(forecast_data)
 
-        
+        return pd.DataFrame(forecast_data)
     except Exception as e:
         st.warning(f"Errore nel forecasting stagionale: {str(e)}. Uso modello semplificato.")
         return simple_forecast(data, periods)
 
 def get_central_forecast_series(forecast_df):
-    """
-    Restituisce una pd.Series con il valore 'centrale' per ogni riga del forecast:
-    - se sono presenti 'yhat_lower' e 'yhat_upper' -> centro = (yhat_lower + yhat_upper) / 2
-    - elif 'yhat' presente -> usa 'yhat'
-    - else -> serie di zeri (fallback)
-    L'indice ritornato sarà la colonna 'ds' convertita in datetime se presente, altrimenti l'indice del DataFrame.
-    """
     if forecast_df is None or forecast_df.empty:
         return pd.Series(dtype=float)
-
-    # preferiamo usare la colonna ds come indice se esiste
     if 'ds' in forecast_df.columns:
         idx = pd.to_datetime(forecast_df['ds'])
     else:
         idx = forecast_df.index
-
     if 'yhat_lower' in forecast_df.columns and 'yhat_upper' in forecast_df.columns:
         central = (forecast_df['yhat_lower'].astype(float) + forecast_df['yhat_upper'].astype(float)) / 2.0
     elif 'yhat' in forecast_df.columns:
         central = forecast_df['yhat'].astype(float)
     else:
         central = pd.Series(0.0, index=forecast_df.index)
-
     central = pd.Series(central.values, index=idx)
     return central
 
 def forecast_with_prophet(data, periods, all_products_data=None, current_sku=None):
-    """
-    Effettua previsione usando stagionalità mensile come metodo principale
-    """
-    # Usa sempre il nuovo modello basato su stagionalità mensile
     return forecast_with_monthly_seasonality(data, periods, all_products_data, current_sku)
 
-def calculate_order_recommendation(forecast_df, current_stock, safety_days, lead_time_days, 
-                                 qty_incoming=0, qty_reserved=0, safety_margin=0.1, moq=1):
-    """
-    Calcola raccomandazioni di ordine con gestione avanzata
-    
-    Args:
-        forecast_df: DataFrame con previsioni
-        current_stock: Stock attualmente disponibile
-        safety_days: Giorni di scorta di sicurezza
-        lead_time_days: Giorni di lead time
-        qty_incoming: Quantità già in arrivo
-        qty_reserved: Quantità già prenotate/riservate
-        safety_margin: Margine di sicurezza aggiuntivo (default 10%)
-        moq: Minimum Order Quantity (quantità minima d'ordine)
-    """
+def calculate_order_recommendation(forecast_df, current_stock, safety_days, lead_time_days,
+                                   qty_incoming=0, qty_reserved=0, safety_margin=0.1, moq=1):
     if forecast_df is None or forecast_df.empty:
         return 0, "good", {}
 
-    # Domanda prevista per il periodo di lead time + safety stock (usando valore centrale)
     total_days = lead_time_days + safety_days
-
-    # Ottieni la serie centrale (media tra yhat_lower e yhat_upper se disponibili, altrimenti yhat)
     central_series = get_central_forecast_series(forecast_df)
-
-    # Somma dei primi total_days valori centrali
     forecast_demand_central = central_series.head(total_days).sum()
-
-    # Applica il margine di sicurezza sul valore centrale (non sul limite superiore)
     forecast_demand = float(forecast_demand_central) * (1 + float(safety_margin))
 
-    # Calcola stock effettivo disponibile
-    # Stock disponibile = stock attuale - prenotato + in arrivo
     effective_stock = current_stock - qty_reserved + qty_incoming
-
-    # Calcola unità da ordinare
     units_needed = forecast_demand - effective_stock
     units_to_order = max(0, units_needed)
-
-    # Arrotonda per eccesso per sicurezza
     units_to_order = math.ceil(units_to_order)
-
-    # Applica MOQ (Minimum Order Quantity)
     if units_to_order > 0 and units_to_order < moq:
         units_to_order = moq
-
-    # Arrotonda al multiplo di MOQ se necessario
     if units_to_order > 0 and moq > 1:
         units_to_order = math.ceil(units_to_order / moq) * moq
 
-    # Determina stato
     if forecast_demand > 0:
         days_of_stock = effective_stock / (forecast_demand / total_days)
     else:
-        # Se non c'è domanda prevista, lo stock è sufficiente
         days_of_stock = float('inf')
 
     if days_of_stock < lead_time_days:
@@ -1055,420 +804,609 @@ def calculate_order_recommendation(forecast_df, current_stock, safety_days, lead
     else:
         status = "good"
 
-    # Info dettagliate per debug
     details = {
-        'forecast_demand': forecast_demand,  # centrale con margine
-        'forecast_demand_central': float(central_series.head(total_days).sum()),  # centrale senza margine
+        'forecast_demand': forecast_demand,
+        'forecast_demand_central': float(central_series.head(total_days).sum()),
         'current_stock': current_stock,
         'qty_reserved': qty_reserved,
         'qty_incoming': qty_incoming,
         'effective_stock': effective_stock,
         'days_of_stock': days_of_stock if days_of_stock != float('inf') else 999
     }
-
     return int(units_to_order), status, details
 
-def create_forecast_chart(historical_data, forecast_data, product_name):
+def _aggregate_series_for_display(daily_hist_series, forecast_df, freq='W'):
     """
-    Crea grafico interattivo delle previsioni
+    Aggrega storico + forecast per la UI (settimanale 'W' o mensile 'M').
     """
+    # storico
+    h = daily_hist_series.copy()
+    if not isinstance(h.index, pd.DatetimeIndex):
+        h.index = pd.to_datetime(h.index)
+    h = h.resample(freq).sum()
+
+    # forecast
+    if forecast_df is None or forecast_df.empty:
+        f = pd.Series(dtype=float)
+    else:
+        fc = get_central_forecast_series(forecast_df)
+        f = fc.resample(freq).sum()
+
+    return h, f
+
+def create_forecast_chart(historical_data, forecast_data, product_name, freq='W'):
+    """
+    Grafico UI aggregato per settimana/mese.
+    """
+    hist, fc = _aggregate_series_for_display(historical_data, forecast_data, freq=freq)
+
     fig = go.Figure()
-    
-    # Dati storici
-    if len(historical_data) > 0:
+    if len(hist) > 0:
         fig.add_trace(go.Scatter(
-            x=historical_data.index,
-            y=historical_data.values,
+            x=hist.index, y=hist.values,
             mode='lines+markers',
-            name='Vendite Storiche',
+            name=f'Vendite Storiche ({ "Settimana" if freq=="W" else "Mese" })',
             line=dict(color='#1f77b4', width=2),
             marker=dict(size=6)
         ))
-    
-    if not forecast_data.empty:
-        # Previsione
+    if forecast_data is not None and not forecast_data.empty:
         fig.add_trace(go.Scatter(
-            x=forecast_data['ds'],
-            y=forecast_data['yhat'],
+            x=fc.index, y=fc.values,
             mode='lines',
-            name='Previsione',
+            name=f'Previsione ({ "Settimana" if freq=="W" else "Mese" })',
             line=dict(color='#ff7f0e', width=2, dash='dash')
         ))
-        
-        # Intervallo di confidenza
-        fig.add_trace(go.Scatter(
-            x=list(forecast_data['ds']) + list(forecast_data['ds'][::-1]),
-            y=list(forecast_data['yhat_upper']) + list(forecast_data['yhat_lower'][::-1]),
-            fill='toself',
-            fillcolor='rgba(255,127,14,0.2)',
-            line=dict(color='rgba(255,255,255,0)'),
-            name='Intervallo Confidenza',
-            showlegend=True
-        ))
-    
+
     fig.update_layout(
-        title=f'Analisi Vendite e Previsioni - {product_name}',
-        xaxis_title='Data',
-        yaxis_title='Unità Vendute',
+        title=f'Vendite & Previsione - {product_name} ({ "Settimanale" if freq=="W" else "Mensile" })',
+        xaxis_title='Periodo',
+        yaxis_title='Unità',
         hovermode='x unified',
-        height=500,
+        height=480,
         showlegend=True
     )
-    
     return fig
 
+def load_product_settings():
+    try:
+        if os.path.exists('product_settings.csv'):
+            settings_df = pd.read_csv('product_settings.csv')
+            settings_df['sku'] = settings_df['sku'].astype(str).str.strip()
+            return settings_df
+        return pd.DataFrame(columns=['sku', 'moq', 'lead_time'])
+    except Exception as e:
+        st.error(f"Errore nel caricamento delle impostazioni prodotti: {str(e)}")
+        return pd.DataFrame(columns=['sku', 'moq', 'lead_time'])
+
+def save_product_settings(settings_df):
+    try:
+        settings_df.to_csv('product_settings.csv', index=False)
+    except Exception as e:
+        st.error(f"Errore nel salvataggio delle impostazioni prodotti: {str(e)}")
+
+def get_stock_fields(stock_info, sku):
+    if stock_info is None or stock_info.empty:
+        return 0, 0, 0
+    row = stock_info[stock_info['sku'].astype(str).str.strip() == str(sku).strip()]
+    if row.empty:
+        return 0, 0, 0
+    qty_reserved = int(row['qty_reserved'].iloc[0]) if 'qty_reserved' in row.columns else 0
+    qty_incoming = int(row['qty_incoming'].iloc[0]) if 'qty_incoming' in row.columns else 0
+    current_stock = int(row['current_stock'].iloc[0]) if 'current_stock' in row.columns else 0
+    return current_stock, qty_reserved, qty_incoming
+
+# -------------------------------
+# MAIN
+# -------------------------------
 def main():
-    # Traduzioni
     translations = load_translations()
-    
-    # Sidebar per controlli
+
+    if 'product_settings' not in st.session_state:
+        st.session_state.product_settings = load_product_settings()
+
     with st.sidebar:
         st.image("https://via.placeholder.com/200x80/1f77b4/white?text=Small+Giants", width=200)
-        
-        # Selezione lingua
         language = st.selectbox("🌐 Language / Lingua", ["it", "en"], index=0)
         t = translations[language]
-        
         st.markdown("---")
-        
-        # Upload file movimenti
         uploaded_file = st.file_uploader(
             "📊 " + t['upload_file'] + " (Movimenti)",
             type=['xlsx', 'xls', 'csv'],
             help="File con movimenti: Date, Type, Internal SKU, Quantity, ecc.",
             key="movements_file"
         )
-        
-        # Upload file stock attuale
         stock_file = st.file_uploader(
             "📦 Carica File Stock Attuale",
             type=['xlsx', 'xls', 'csv'],
             help="File con stock: SKU interno, Q.tà disponibile, Q.tà in stock, ecc.",
             key="stock_file"
         )
-        
-        # Parametri di forecasting
         st.markdown("### ⚙️ Parametri")
         forecast_days = st.slider(t['forecast_days'], 30, 365, 90)
         safety_stock_days = st.slider(t['safety_stock'], 7, 30, 14)
-        lead_time_days = st.slider(t['lead_time'], 1, 30, 7)
-        
-        st.markdown("### 📦 Parametri Avanzati")
-        safety_margin = st.slider("Margine di Sicurezza (%)", 0, 50, 10) / 100
-        moq = st.number_input("MOQ - Quantità Minima d'Ordine", min_value=1, value=1, step=1)
-    
-    # Header principale
-    st.markdown(f"<h1 class='main-header'>{t['title']}</h1>", unsafe_allow_html=True)
-    
-    if uploaded_file is not None:
-        try:
-            # Carica e processa i dati
-            with st.spinner(t['processing']):
-                # Leggi il file
-                if uploaded_file.name.endswith('.csv'):
-                    # Prova diversi separatori e encoding
-                    try:
-                        raw_df = pd.read_csv(uploaded_file, encoding='utf-8', sep=',')
-                        if len(raw_df.columns) == 1:
-                            uploaded_file.seek(0)
-                            raw_df = pd.read_csv(uploaded_file, encoding='utf-8', sep=';')
-                        if len(raw_df.columns) == 1:
-                            uploaded_file.seek(0)
-                            raw_df = pd.read_csv(uploaded_file, encoding='utf-8', sep='\t')
-                    except:
-                        uploaded_file.seek(0)
-                        raw_df = pd.read_csv(uploaded_file, encoding='latin-1', sep=';')
-                else:
-                    raw_df = pd.read_excel(uploaded_file)
-                
-                st.write(f"📁 **File caricato:** {uploaded_file.name}")
-                st.write(f"📊 **Righe totali:** {len(raw_df)}")
-                
-                # Processa i dati
-                df = process_excel_data(raw_df)
-                
-                if df.empty:
-                    st.error("❌ Nessun dato valido trovato nel file caricato.")
-                    return
-        
-            # Selezione prodotto
-            available_products = df['sku'].unique()
-            product_options = []
-            
-            for sku in available_products:
-                product_name = df[df['sku']==sku]['product_name'].iloc[0]
-                product_options.append(f"{sku} - {product_name}")
-            
-            selected_product_display = st.selectbox(t['select_product'], product_options)
-            selected_sku = selected_product_display.split(' - ')[0]
-            
-            # Filtra dati per prodotto selezionato
-            product_data = df[df['sku'] == selected_sku].copy()
-            
-            if product_data.empty:
-                st.warning(t['no_data'])
-                return
-            
-            # Prepara dati per l'analisi
-            product_data = product_data.sort_values('date')
-            product_data.set_index('date', inplace=True)
-            
-            # Raggruppa per data (in caso di duplicati)
-            daily_sales = product_data.groupby('date')['units_sold'].sum()
-            
-            # Ottieni stock attuale dal file stock se disponibile
-            current_stock = 0
-            qty_reserved = 0
-            qty_incoming = 0
-            
-            if stock_file is not None:
-                try:
-                    # Leggi il file stock
-                    if stock_file.name.endswith('.csv'):
-                        try:
-                            stock_raw_df = pd.read_csv(stock_file, encoding='utf-8', sep=',')
-                            if len(stock_raw_df.columns) == 1:
-                                stock_file.seek(0)
-                                stock_raw_df = pd.read_csv(stock_file, encoding='utf-8', sep=';')
-                        except:
-                            stock_file.seek(0)
-                            stock_raw_df = pd.read_csv(stock_file, encoding='latin-1', sep=';')
-                    else:
-                        stock_raw_df = pd.read_excel(stock_file)
-                    
-                    # Processa il file stock
-                    stock_df = process_stock_file(stock_raw_df)
-                    
-                    if not stock_df.empty:
-                        # Cerca il prodotto corrente
-                        product_stock = stock_df[stock_df['sku'].astype(str).str.strip() == str(selected_sku).strip()]
-                        
-                        if not product_stock.empty:
-                            current_stock = float(product_stock['current_stock'].iloc[0])
-                            if 'qty_reserved' in product_stock.columns:
-                                qty_reserved = float(product_stock['qty_reserved'].iloc[0])
-                            if 'qty_incoming' in product_stock.columns:
-                                qty_incoming = float(product_stock['qty_incoming'].iloc[0])
-                            
-                            st.success(f"✅ Stock trovato nel file: {current_stock:,.0f} unità")
-                            if qty_reserved > 0:
-                                st.info(f"📋 Quantità prenotate: {qty_reserved:,.0f}")
-                            if qty_incoming > 0:
-                                st.info(f"📦 Quantità in arrivo: {qty_incoming:,.0f}")
-                        else:
-                            st.warning(f"⚠️ SKU {selected_sku} non trovato nel file stock. Uso l'ultimo valore dai movimenti.")
-                            current_stock = product_data['on_hand_end'].iloc[-1] if len(product_data) > 0 else 0
-                except Exception as e:
-                    st.warning(f"⚠️ Errore lettura file stock: {str(e)}. Uso l'ultimo valore dai movimenti.")
-                    current_stock = product_data['on_hand_end'].iloc[-1] if len(product_data) > 0 else 0
-            else:
-                # Se non c'è file stock, usa l'ultimo valore dai movimenti
-                current_stock = product_data['on_hand_end'].iloc[-1] if len(product_data) > 0 else 0
-                st.info("💡 File stock non caricato. Usando l'ultimo valore dai movimenti di magazzino.")
-            
 
-            # Effettua previsione
-            with st.spinner("Generando previsioni..."):
-                # Prepara dati di tutti i prodotti per stagionalità
-                all_products_sales = df.copy()
-                all_products_sales = all_products_sales.set_index('date')
-                
-                forecast = forecast_with_prophet(daily_sales, forecast_days, 
-                                                 all_products_data=all_products_sales,
-                                                 current_sku=selected_sku)
-                
-            # Calcola media mensile storica escludendo OOS
-            monthly_stats = calculate_monthly_average_excluding_oos(daily_sales, min_run_days=14)
-            
-            # Layout a colonne - aggiungiamo una quarta colonna
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                st.metric(
-                    label=t['current_stock'],
-                    value=f"{current_stock:,}",
-                    delta=None
-                )
-            
-            with col2:
-                if not forecast.empty:
-                    # Usa la serie centrale per la metrica mostrata (coerente con il calcolo degli ordini)
-                    central_series_ui = get_central_forecast_series(forecast)
-                    predicted_demand = int(central_series_ui.head(lead_time_days + safety_stock_days).sum())
-                    st.metric(
-                        label=t['predicted_demand'],
-                        value=f"{predicted_demand:,}",
-                        delta=None
-                    )
-                else:
-                    predicted_demand = 0
-            with col3:
-                st.metric(
-                    label="📊 Media Mensile Storica",
-                    value=f"{monthly_stats['monthly_avg']:,.0f}",
-                    delta=None,
-                    help=f"Calcolata su {monthly_stats['valid_months']} mesi validi (pesati: {monthly_stats['weighted_months']:.1f}), esclusi {monthly_stats['oos_months']} mesi completamente OOS"
-                )
-                
-            with col4:
-                units_to_order, status, details = calculate_order_recommendation(
-                    forecast, current_stock, safety_stock_days, lead_time_days,
-                    qty_incoming=qty_incoming, qty_reserved=qty_reserved,
-                    safety_margin=safety_margin, moq=moq
-                )
-                
-                status_colors = {
-                    "critical": "#ff4444",
-                    "warning": "#ffaa00", 
-                    "good": "#00aa44"
-                }
-                
-                st.metric(
-                    label=t['units_to_order'],
-                    value=f"{units_to_order:,}",
-                    delta=None
-                )
-                
-                # Stato con colore
-                status_text = t[status]
-                st.markdown(f"<p style='color: {status_colors[status]}; font-weight: bold; text-align: center;'>"
-                           f"Status: {status_text}</p>", unsafe_allow_html=True)
-            
-            # Mostra dettagli calcolo in un expander
-            with st.expander("🔍 Dettagli Calcolo Ordine"):
-                st.markdown("#### 📊 Statistiche Storiche")
-                st.write(f"**Media Mensile (ponderata):** {monthly_stats['monthly_avg']:,.1f} unità/mese")
-                st.write(f"**Periodo analizzato:** da {monthly_stats['first_sale_date'].strftime('%Y-%m-%d') if monthly_stats['first_sale_date'] else 'N/A'} "
-                        f"a {monthly_stats['last_sale_date'].strftime('%Y-%m-%d') if monthly_stats['last_sale_date'] else 'N/A'}")
-                st.write(f"**Mesi totali nel periodo:** {monthly_stats['total_months']}")
-                st.write(f"**Mesi validi (con vendite):** {monthly_stats['valid_months']}")
-                st.write(f"**Mesi completamente OOS (esclusi):** {monthly_stats['oos_months']}")
-                st.write(f"**Mesi ponderati equivalenti:** {monthly_stats['weighted_months']:.1f}")
-                st.write(f"**Vendite totali (mesi validi):** {monthly_stats['total_sales']:,.0f} unità")
-                st.write(f"**Media semplice (no pesi):** {monthly_stats.get('monthly_avg_simple', 0):,.1f} unità/mese")
-                
-                # Debug dettagliato mesi
-                if st.checkbox("🔍 Mostra dettaglio per mese"):
-                    if 'monthly_breakdown' in monthly_stats:
-                        breakdown_df = pd.DataFrame(monthly_stats['monthly_breakdown'])
-                        breakdown_df['month_label'] = breakdown_df.apply(
-                            lambda x: f"{x['year']}-{x['month_num']:02d}", axis=1
-                        )
-                        breakdown_df = breakdown_df[['month_label', 'sales', 'weight', 'oos_days', 'valid_days', 'total_days']]
-                        breakdown_df.columns = ['Mese', 'Vendite', 'Peso', 'Giorni OOS', 'Giorni Validi', 'Giorni Totali']
-                        st.dataframe(breakdown_df, use_container_width=True)
-                        
-                        st.write(f"**Verifica calcolo:**")
-                        st.write(f"Somma vendite mesi validi: {monthly_stats['total_sales']:,.0f}")
-                        st.write(f"Numero mesi validi: {monthly_stats['valid_months']}")
-                        st.write(f"Media se dividessi semplicemente: {monthly_stats['total_sales']/monthly_stats['valid_months']:,.0f}")
-                st.markdown("---")
-                st.markdown("#### 💼 Dettagli Ordine")
-                st.write(f"**Domanda Prevista ({lead_time_days + safety_stock_days} giorni):** {details['forecast_demand']:,.1f} unità")
-                # Mostra anche il valore centrale senza margine
-                if 'forecast_demand_central' in details:
-                    st.write(f"**Domanda Prevista (centrale, senza margine):** {details['forecast_demand_central']:,.1f} unità")
-                st.write(f"**Stock Fisico:** {details['current_stock']:,.0f} unità")
-                st.write(f"**Quantità Prenotate:** {details['qty_reserved']:,.0f} unità")
-                st.write(f"**Quantità in Arrivo:** {details['qty_incoming']:,.0f} unità")
-                st.write(f"**Stock Effettivo Disponibile:** {details['effective_stock']:,.1f} unità")
-                st.write(f"**Giorni di Copertura:** {details['days_of_stock']:.1f} giorni")
-                st.write(f"**Margine di Sicurezza Applicato:** {safety_margin*100:.0f}%")
-                st.write(f"**MOQ Applicato:** {moq} unità")
-                
-                # Calcola quando finirà lo stock
-                if details['forecast_demand'] > 0:
-                    avg_daily_demand = details['forecast_demand'] / (lead_time_days + safety_stock_days)
-                    stockout_days = details['effective_stock'] / avg_daily_demand if avg_daily_demand > 0 else 999
-                    stockout_date = datetime.now() + timedelta(days=int(stockout_days))
-                    st.warning(f"⚠️ **Previsto esaurimento scorte:** {stockout_date.strftime('%Y-%m-%d')} (tra {int(stockout_days)} giorni)")
-            
-            # Grafico principale
-            st.markdown("---")
-            
-            if len(daily_sales) > 0:
-                product_name = product_data['product_name'].iloc[0] if 'product_name' in product_data.columns else selected_sku
-                chart = create_forecast_chart(daily_sales, forecast, product_name)
-                st.plotly_chart(chart, use_container_width=True)
-            
-            # Tabelle dettagliate
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.subheader(t['historical_data'])
-                if len(daily_sales) > 0:
-                    hist_df = daily_sales.tail(10).reset_index()
-                    hist_df['date'] = hist_df['date'].dt.strftime('%Y-%m-%d')
-                    hist_df.columns = ['Data', 'Vendite']
-                    st.dataframe(hist_df, use_container_width=True)
-                else:
-                    st.info(t['no_data'])
-            
-            with col2:
-                st.subheader(t['forecast'])
-                if not forecast.empty:
-                    forecast_display = forecast.head(10).copy()
-                    forecast_display['ds'] = forecast_display['ds'].dt.strftime('%Y-%m-%d')
-                    forecast_display['yhat'] = forecast_display['yhat'].round().astype(int)
-                    forecast_display = forecast_display[['ds', 'yhat']].copy()
-                    forecast_display.columns = ['Data', 'Previsione']
-                    st.dataframe(forecast_display, use_container_width=True)
-                else:
-                    st.info("Dati insufficienti per la previsione")
-        
-        except Exception as e:
-            st.error(f"Errore nell'elaborazione: {str(e)}")
-            import traceback
-            st.error("Stack trace completo:")
-            st.code(traceback.format_exc())
-    
-    else:
-        # Pagina di benvenuto
+        st.markdown("### 📦 Parametri Avanzati")
+        # percentuale 0..1
+        safety_margin = st.slider("Margine di Sicurezza (%)", 0, 50, 10) / 100
+
+        st.markdown("### 📈 Visualizzazione")
+        view_freq = st.radio("Granularità grafici", options=["Settimanale", "Mensile"], index=0, horizontal=True)
+        freq = 'W' if view_freq == "Settimanale" else 'M'
+
+    st.markdown(f"<h1 class='main-header'>{t['title']}</h1>", unsafe_allow_html=True)
+    # Link rapido per saltare al riepilogo, prima dell’elaborazione
+    st.markdown('<p><a href="#riepilogo-prodotti">⬇️ Vai al Riepilogo Prodotti</a></p>', unsafe_allow_html=True)
+
+    if uploaded_file is None:
         st.markdown("""
         ## 👋 Benvenuto nel Sistema di Previsione Inventario
-        
-        ### 📁 Come utilizzare l'app:
-        1. **Carica il tuo file Excel/CSV** nella barra laterale (movimenti magazzino)
-        2. **Carica il file stock attuale** (opzionale ma consigliato)
-        3. **Seleziona un prodotto** dalla lista
-        4. **Regola i parametri** di previsione e ordine
-        5. **Analizza** le raccomandazioni di riordino
-        
-        ### 📊 Cosa ottieni:
-        - **Previsioni** delle vendite future basate su AI
-        - **Raccomandazioni** di riordino personalizzate con MOQ
-        - **Gestione avanzata** stock: prenotati, in arrivo, disponibili
-        - **Grafici interattivi** delle vendite e previsioni
-        - **Analisi** dello stato dell'inventario
-        - **Data prevista** esaurimento scorte
-        
-        ### 📋 Formato file movimenti richiesto:
-        Il file deve contenere le colonne:
-        - `Date` (o simile) - Data del movimento
-        - `Type` (o simile) - Tipo movimento (entrata/uscita)
-        - `Internal SKU` (o simile) - Codice prodotto
-        - `Quantity` (o simile) - Quantità
-        - `Name` (opzionale) - Nome del prodotto
-        
-        ### 📦 Formato file stock attuale (opzionale):
-        Il file deve contenere le colonne:
-        - `SKU interno` (o simile) - Codice prodotto
-        - `Q.tà disponibile` o `Q.tà in stock` - Quantità attuale
-        - `Q.tà prenotate` (opzionale) - Quantità riservate
-        - `In attesa di ricezione` (opzionale) - Quantità in arrivo
-        
-        **Nota:** L'app riconoscerà automaticamente le colonne anche con nomi simili!
-        
-        ### 🎯 Funzionalità Avanzate:
-        - **Arrotondamento per eccesso**: ordini sempre sufficienti
-        - **MOQ**: rispetta quantità minime d'ordine
-        - **Margine di sicurezza**: buffer aggiuntivo configurabile
-        - **Stock effettivo**: considera prenotati e in arrivo
-        - **Previsioni conservative**: usa limiti superiori intervallo confidenza
-        """)
-# --- AUTH ---
-import os
 
+        1. Carica movimenti
+        2. Carica stock
+        3. Analizza previsioni e raccomandazioni di ordine
+        """)
+        return
+
+    # ------- Processamento completo -------
+    with st.spinner(translations['it']['processing']):
+        # Lettura movimenti
+        try:
+            if uploaded_file.name.endswith('.csv'):
+                try:
+                    raw_df = pd.read_csv(uploaded_file, encoding='utf-8-sig', sep=',')
+                    if len(raw_df.columns) == 1:
+                        uploaded_file.seek(0)
+                        raw_df = pd.read_csv(uploaded_file, encoding='utf-8-sig', sep=';')
+                except:
+                    uploaded_file.seek(0)
+                    raw_df = pd.read_csv(uploaded_file, encoding='latin-1', sep=',')
+            else:
+                raw_df = pd.read_excel(uploaded_file)
+            st.write(f"📁 **File caricato:** {uploaded_file.name}")
+            st.write(f"📊 **Righe totali:** {len(raw_df)}")
+            df = process_excel_data(raw_df)
+            if df.empty:
+                st.error("❌ Nessun dato valido trovato nel file caricato.")
+                return
+        except Exception as e:
+            st.error(f"Errore durante l'elaborazione del file: {str(e)}")
+            return
+
+        # Lettura stock UNA SOLA VOLTA
+        stock_info = pd.DataFrame()
+        if stock_file is not None:
+            try:
+                if stock_file.name.endswith('.csv'):
+                    try:
+                        stock_raw_df = pd.read_csv(stock_file, encoding='utf-8-sig', sep=',')
+                        if len(stock_raw_df.columns) == 1:
+                            stock_file.seek(0)
+                            stock_raw_df = pd.read_csv(stock_file, encoding='utf-8-sig', sep=';')
+                    except:
+                        stock_file.seek(0)
+                        stock_raw_df = pd.read_csv(stock_file, encoding='latin-1', sep=',')
+                else:
+                    stock_raw_df = pd.read_excel(stock_file)
+                # pulizia intestazioni da BOM
+                stock_raw_df.columns = [str(c).strip().replace('\ufeff','') for c in stock_raw_df.columns]
+                st.write(f"📋 Colonne trovate nel file stock: {list(stock_raw_df.columns)}")
+                st.write(f"📊 Righe nel file stock: {len(stock_raw_df)}")
+                stock_info = process_stock_file(stock_raw_df)
+            except Exception as e:
+                st.error(f"Errore nel processare il file stock: {str(e)}")
+                st.info("Procedo senza stock file.")
+                stock_info = pd.DataFrame()
+
+        # Attivi: movimenti ultimi 12 mesi o stock presente
+        active_products = []
+        twelve_months_ago = datetime.now() - timedelta(days=365)
+
+        # df: colonne ['date','sku','product_name','units_sold','units_sold_b2b','units_sold_b2c','on_hand_end']
+        for sku in df['sku'].unique():
+            product_data = df[df['sku'] == sku].copy().sort_values('date')
+            product_data.set_index('date', inplace=True)
+            # vendite in ultimi 12 mesi
+            recent_movements = product_data[product_data.index >= twelve_months_ago]['units_sold'].sum()
+
+            current_stock, _, _ = get_stock_fields(stock_info, sku)
+            if current_stock > 0 or recent_movements > 0:
+                product_name = product_data['product_name'].iloc[0] if 'product_name' in product_data.columns else f"Prodotto {sku}"
+                active_products.append({
+                    'sku': sku,
+                    'name': product_name,
+                    'current_stock': int(current_stock),
+                    'recent_movements': int(recent_movements)
+                })
+
+        if not active_products:
+            st.warning("❌ Nessun prodotto attivo trovato")
+            return
+
+        products_df = pd.DataFrame(active_products)
+
+        # Calcolo tasso crescita globale una volta
+        try:
+            st.write("🌍 Calcolo tasso di crescita globale...")
+            all_sales_data = df.copy().sort_values('date').set_index('date')
+            global_series = all_sales_data.groupby(all_sales_data.index)['units_sold'].sum()
+            global_growth = calculate_growth_rate(global_series, None)
+            st.write(f"📈 Tasso di crescita globale: {global_growth*100:.1f}%")
+        except Exception as e:
+            st.error(f"Errore nel calcolo del tasso di crescita globale: {str(e)}")
+            global_growth = 0.0
+
+        # Impostazioni prodotto
+        if 'moq_values' not in st.session_state:
+            st.session_state.moq_values = {}
+        product_settings = st.session_state.product_settings
+
+        results = []
+
+        # CICLO PER SKU
+        for _, prow in products_df.iterrows():
+            sku = prow['sku']
+            product_name = prow['name']
+
+            # dataset singolo prodotto
+            product_data = df[df['sku'] == sku].copy().sort_values('date').set_index('date')
+
+            # serie giornaliere (totali + split canale)
+            daily_sales = product_data['units_sold'].resample('D').sum().fillna(0)
+
+            if 'units_sold_b2b' in product_data.columns:
+                daily_b2b = product_data['units_sold_b2b'].resample('D').sum().fillna(0)
+                daily_b2c = product_data['units_sold_b2c'].resample('D').sum().fillna(0)
+            else:
+                daily_b2b = pd.Series(0, index=daily_sales.index)
+                daily_b2c = pd.Series(0, index=daily_sales.index)
+
+            # stock fields
+            current_stock, qty_reserved, qty_incoming = get_stock_fields(stock_info, sku)
+
+            # growth: scegli max tra prodotto e globale
+            product_growth = calculate_growth_rate(daily_sales, None)
+            growth_rate = max(product_growth, global_growth)
+            st.write(f"📊 Confronto tassi crescita per {sku}: Prodotto {product_growth*100:.1f}%, Globale {global_growth*100:.1f}%, Scelto {growth_rate*100:.1f}%")
+
+            # previsioni: totale + per canale
+            all_products_sales = df.copy().set_index('date')
+
+            forecast_total = forecast_with_prophet(daily_sales, forecast_days,
+                                                   all_products_data=all_products_sales,
+                                                   current_sku=sku)
+            forecast_b2b = forecast_with_prophet(daily_b2b, forecast_days,
+                                                 all_products_data=all_products_sales,
+                                                 current_sku=f"{sku}_B2B")
+            forecast_b2c = forecast_with_prophet(daily_b2c, forecast_days,
+                                                 all_products_data=all_products_sales,
+                                                 current_sku=f"{sku}_B2C")
+
+            central_total = get_central_forecast_series(forecast_total)
+            central_b2c   = get_central_forecast_series(forecast_b2c)
+            # B2B = Totale - B2C, mai negativo
+            central_b2b   = (central_total - central_b2c).clip(lower=0)
+
+            # settings: moq e lead time
+            if not product_settings[product_settings['sku'] == str(sku)].empty:
+                product_moq = int(product_settings.loc[product_settings['sku']==str(sku), 'moq'].iloc[0]) if 'moq' in product_settings.columns else 1
+                product_lead_time = int(product_settings.loc[product_settings['sku']==str(sku), 'lead_time'].iloc[0]) if 'lead_time' in product_settings.columns else 7
+            else:
+                product_moq = 1
+                product_lead_time = 7
+
+            units_to_order, status, details = calculate_order_recommendation(
+                forecast_total, current_stock, safety_stock_days, product_lead_time,
+                qty_incoming=qty_incoming, qty_reserved=qty_reserved,
+                safety_margin=safety_margin, moq=product_moq
+            )
+
+            # media mensile storica (totale)
+            monthly_stats = calculate_monthly_average_excluding_oos(daily_sales, min_run_days=14)
+            avg_monthly = monthly_stats['monthly_avg']
+            last_month_avg = float(daily_sales.tail(30).mean() * 30)
+
+            # forecast 30/90 per canale
+            f30_b2b = int(central_b2b[:30].sum()) if not central_b2b.empty else 0
+            f30_b2c = int(central_b2c[:30].sum()) if not central_b2c.empty else 0
+            f90_b2b = int(central_b2b[:90].sum()) if not central_b2b.empty else 0
+            f90_b2c = int(central_b2c[:90].sum()) if not central_b2c.empty else 0
+
+            results.append({
+                'sku': sku,
+                'name': product_name,
+                'current_stock': int(current_stock),
+                'forecast_30d_total': int(central_total[:30].sum()) if not central_total.empty else 0,
+                'forecast_30d_b2b': f30_b2b,
+                'forecast_30d_b2c': f30_b2c,
+                'forecast_90d_total': int(central_total[:90].sum()) if not central_total.empty else 0,
+                'forecast_90d_b2b': f90_b2b,
+                'forecast_90d_b2c': f90_b2c,
+                'qty_reserved': int(qty_reserved),
+                'qty_incoming': int(qty_incoming),
+                'status': status,
+                'units_to_order': int(units_to_order),
+                'monthly_avg': int(round(avg_monthly)),
+                'last_month_avg': int(round(last_month_avg)),
+                'moq': int(product_moq),
+                'lead_time': int(product_lead_time)
+            })
+
+        # ------- TABELLA RIEPILOGO (IN ALTO) -------
+        results_df = pd.DataFrame(results)
+
+        st.markdown('<a id="riepilogo-prodotti"></a>', unsafe_allow_html=True)
+        st.markdown("### 📊 Riepilogo Prodotti")
+
+        # Mappa stato con emoji e rinomina colonne come prima
+        status_map = {'critical':'🔴 Critico','warning':'🟡 Attenzione','good':'🟢 OK'}
+        results_df['status'] = results_df['status'].map(status_map)
+
+        show_df = results_df.rename(columns={
+            'sku': 'SKU',
+            'name': 'Nome Prodotto',
+            'current_stock': 'Stock Attuale',
+            'forecast_30d_total': 'Prev 30gg (Tot)',
+            'forecast_30d_b2b': 'Prev 30gg B2B',
+            'forecast_30d_b2c': 'Prev 30gg B2C',
+            'forecast_90d_total': 'Prev 90gg (Tot)',
+            'forecast_90d_b2b': 'Prev 90gg B2B',
+            'forecast_90d_b2c': 'Prev 90gg B2C',
+            'qty_reserved': 'Prenotate',
+            'qty_incoming': 'In Arrivo',
+            'status': 'Stato',
+            'units_to_order': 'Da Ordinare',
+            'monthly_avg': 'Media Mensile',
+            'last_month_avg': 'Media Ultimo Mese',
+            'moq': 'MOQ',
+            'lead_time': 'Lead Time'
+        })
+
+        # Costruisci le opzioni Ag-Grid
+        gb = GridOptionsBuilder.from_dataframe(show_df)
+
+        # Prima rendi tutte le colonne ridimensionabili
+        gb.configure_default_column(resizable=True)
+
+
+        # Pinna le prime due e impedisci il fit su di loro (verranno dimensionate via JS)
+        gb.configure_column("SKU", pinned="left", suppressSizeToFit=True)
+        gb.configure_column(
+            "Nome Prodotto",
+            pinned="left",
+            suppressSizeToFit=True,
+            wrapText=True,          # abilita wrap lato AG Grid
+            autoHeight=True,        # fa crescere la riga se va a capo
+            headerTooltip="Nome Prodotto",
+            cellStyle={"white-space": "normal"}  # forza wrap del testo cella
+        )
+
+        # Tutte le altre colonne usano flex (si adattano allo spazio restante)
+        for col in [c for c in show_df.columns if c not in ["SKU", "Nome Prodotto"]]:
+            gb.configure_column(col, flex=1)
+
+        # Modifica / editing per MOQ e Lead Time
+        gb.configure_column("MOQ", editable=True, type=["numericColumn"])
+        gb.configure_column("Lead Time", editable=True, type=["numericColumn"])
+
+        # Selezione riga singola con checkbox
+        gb.configure_selection(selection_mode="single", use_checkbox=True)
+
+        # Niente paginazione: una sola vista con scroll
+        gb.configure_grid_options(pagination=False, domLayout='normal')
+
+        # ---- JS: autosize 1ª colonna, copia larghezza sulla 2ª, fit per le altre ----
+        gb.configure_grid_options(
+            onFirstDataRendered=JsCode("""
+                function(params){
+                    // autosize solo la prima colonna
+                    var firstColId = 'SKU';
+                    params.columnApi.autoSizeColumns([firstColId], false);
+
+                    // prendi larghezza effettiva della 1ª
+                    var firstWidth = params.columnApi.getColumn(firstColId).getActualWidth();
+
+                    // imposta la 2ª ('Nome Prodotto') alla stessa larghezza
+                    params.columnApi.setColumnWidths([
+                        { key: 'Nome Prodotto', newWidth: firstWidth }
+                    ]);
+
+                    // ora adatta tutte le altre al contenitore (le prime due sono suppressSizeToFit=True)
+                    params.api.sizeColumnsToFit();
+
+                    // abilita wrap anche sull'header (se supportato)
+                    try {
+                        var col = params.columnApi.getColumn('Nome Prodotto');
+                        if (col && col.getColDef()) {
+                            col.getColDef().wrapHeaderText = true;
+                            col.getColDef().autoHeaderHeight = true;
+                            params.api.refreshHeader();
+                        }
+                    } catch(e) {}
+                }
+            """)
+        )
+
+
+        grid_options = gb.build()
+
+        grid_response = AgGrid(
+            show_df,
+            gridOptions=grid_options,
+            update_mode=GridUpdateMode.MODEL_CHANGED,  # ricevi data aggiornata quando l'utente edita
+            allow_unsafe_jscode=True,
+            fit_columns_on_grid_load=False,
+            theme="balham",  # o "streamlit", "alpine"
+            height=800
+        )
+
+        # Leggi eventuali modifiche a MOQ/Lead Time e salvale come prima
+        edited_df = pd.DataFrame(grid_response["data"])
+        new_settings = []
+        for _, row in edited_df.iterrows():
+            new_settings.append({
+                'sku': row['SKU'],
+                'moq': int(row['MOQ']),
+                'lead_time': int(row['Lead Time'])
+            })
+        st.session_state.product_settings = pd.DataFrame(new_settings)
+        save_product_settings(st.session_state.product_settings)
+
+        # --- Recupero riga selezionata da Ag-Grid (robusto) ---
+        selected_rows = grid_response.get("selected_rows", [])
+
+        # Se AgGrid restituisce un DataFrame, converti in list-of-dicts
+        if isinstance(selected_rows, pd.DataFrame):
+            selected_rows = selected_rows.to_dict("records")
+
+        # Controllo “vuoto” sicuro
+        if selected_rows is None or len(selected_rows) == 0:
+            st.info("Seleziona un prodotto nella tabella per vedere il dettaglio.")
+            st.stop()
+
+        # Prima (e unica) riga selezionata
+        selected_row = selected_rows[0]
+
+        # Nomi colonne robusti (a seconda dei rename fatti a monte)
+        sku_show  = selected_row.get("SKU") or selected_row.get("sku")
+        name_show = selected_row.get("Nome Prodotto") or selected_row.get("name")
+
+
+        st.markdown("<p class='small-note'>Suggerimento: seleziona una sola riga per aprire il pannello dettagli.</p>", unsafe_allow_html=True)
+
+        # ------- DETTAGLIO PRODOTTO (apre da tabella) -------
+
+        product_data_show = df[df['sku']==sku_show].copy().sort_values('date').set_index('date')
+        daily_sales_show = product_data_show['units_sold'].resample('D').sum().fillna(0)
+
+        # split canale per il dettaglio
+        if 'units_sold_b2b' in product_data_show.columns:
+            daily_b2c_show = product_data_show['units_sold_b2c'].resample('D').sum().fillna(0)
+            daily_b2b_show = (daily_sales_show - daily_b2c_show).clip(lower=0)
+        else:
+            daily_b2b_show = pd.Series(0, index=daily_sales_show.index)
+            daily_b2c_show = pd.Series(0, index=daily_sales_show.index)
+
+        forecast_show = forecast_with_prophet(daily_sales_show, forecast_days, all_products_data=df.set_index('date'), current_sku=sku_show)
+        forecast_b2b_show = forecast_with_prophet(daily_b2b_show, forecast_days, all_products_data=df.set_index('date'), current_sku=f"{sku_show}_B2B")
+        forecast_b2c_show = forecast_with_prophet(daily_b2c_show, forecast_days, all_products_data=df.set_index('date'), current_sku=f"{sku_show}_B2C")
+
+        central_series_ui = get_central_forecast_series(forecast_show)
+
+        # metriche quick
+        current_stock, qty_reserved, qty_incoming = get_stock_fields(stock_info, sku_show)
+        product_settings = st.session_state.product_settings
+        if not product_settings[product_settings['sku'] == str(sku_show)].empty:
+            product_lead_time = int(product_settings.loc[product_settings['sku']==str(sku_show), 'lead_time'].iloc[0]) if 'lead_time' in product_settings.columns else 7
+            product_moq = int(product_settings.loc[product_settings['sku']==str(sku_show), 'moq'].iloc[0]) if 'moq' in product_settings.columns else 1
+        else:
+            product_lead_time = 7
+            product_moq = 1
+
+        units_to_order, status, details = calculate_order_recommendation(
+            forecast_show, current_stock, safety_stock_days, product_lead_time,
+            qty_incoming=qty_incoming, qty_reserved=qty_reserved,
+            safety_margin=safety_margin, moq=product_moq
+        )
+
+        monthly_stats_show = calculate_monthly_average_excluding_oos(daily_sales_show, min_run_days=14)
+
+        st.markdown("---")
+        st.subheader(f"🔎 Dettaglio: {name_show} ({sku_show})")
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric(label=translations['it']['current_stock'], value=f"{current_stock:,}")
+        with col2:
+            predicted_demand = int(central_series_ui.head(product_lead_time + safety_stock_days).sum()) if not central_series_ui.empty else 0
+            st.metric(label=translations['it']['predicted_demand'], value=f"{predicted_demand:,}")
+        with col3:
+            st.metric(label="📊 Media Mensile Storica", value=f"{monthly_stats_show['monthly_avg']:,.0f}")
+        with col4:
+            st.metric(label=translations['it']['units_to_order'], value=f"{units_to_order:,}")
+            status_colors = {"critical":"#ff4444","warning":"#ffaa00","good":"#00aa44"}
+            st.markdown(f"<p style='color:{status_colors[status]};font-weight:bold;text-align:center;'>Status: {translations['it'][status]}</p>", unsafe_allow_html=True)
+
+        # Forecast 30/90 per canale (mostra anche qui)
+        central_b2c_show = get_central_forecast_series(forecast_b2c_show)
+        # Totale centrale già calcolato: central_series_ui
+        central_b2b_show = (central_series_ui - central_b2c_show).clip(lower=0)
+        f30_b2b_show = int(central_b2b_show[:30].sum()) if not central_b2b_show.empty else 0
+        f30_b2c_show = int(central_b2c_show[:30].sum()) if not central_b2c_show.empty else 0
+        f90_b2b_show = int(central_b2b_show[:90].sum()) if not central_b2b_show.empty else 0
+        f90_b2c_show = int(central_b2c_show[:90].sum()) if not central_b2c_show.empty else 0
+
+        st.markdown(f"**Previsione 30gg** → B2B: **{f30_b2b_show}** · B2C: **{f30_b2c_show}**  |  **Previsione 90gg** → B2B: **{f90_b2b_show}** · B2C: **{f90_b2c_show}**")
+
+        with st.expander("🔍 Dettagli Calcolo Ordine"):
+            st.markdown("#### 📊 Statistiche Storiche")
+            st.write(f"Media Mensile (ponderata): {monthly_stats_show['monthly_avg']:,.1f}")
+            st.write(f"Periodo: {monthly_stats_show['first_sale_date']} → {monthly_stats_show['last_sale_date']}")
+            st.write(f"Mesi totali: {monthly_stats_show['total_months']}")
+            st.write(f"Mesi validi: {monthly_stats_show['valid_months']}")
+            st.write(f"Mesi OOS: {monthly_stats_show['oos_months']}")
+            st.write(f"Mesi ponderati equivalenti: {monthly_stats_show['weighted_months']:.1f}")
+            st.write(f"Vendite totali: {monthly_stats_show['total_sales']:,.0f}")
+            st.markdown("---")
+            st.markdown("#### 💼 Dettagli Ordine")
+            st.write(f"Domanda Prevista ({product_lead_time + safety_stock_days} gg): {details['forecast_demand']:,.1f}")
+            st.write(f"Domanda Prevista (centrale): {details['forecast_demand_central']:,.1f}")
+            st.write(f"Stock Fisico: {details['current_stock']:,.0f}")
+            st.write(f"Prenotate: {details['qty_reserved']:,.0f}")
+            st.write(f"In Arrivo: {details['qty_incoming']:,.0f}")
+            st.write(f"Stock Effettivo: {details['effective_stock']:,.1f}")
+            st.write(f"Giorni copertura: {details['days_of_stock']:.1f}")
+            st.write(f"Margine di sicurezza: {int(safety_margin*100)}%")
+            st.write(f"MOQ: {product_moq}")
+
+            if details['forecast_demand'] > 0:
+                avg_daily_demand = details['forecast_demand'] / (product_lead_time + safety_stock_days)
+                stockout_days = details['effective_stock'] / avg_daily_demand if avg_daily_demand > 0 else 999
+                stockout_date = datetime.now() + timedelta(days=int(stockout_days))
+                st.warning(f"⚠️ Previsto esaurimento scorte: {stockout_date.strftime('%Y-%m-%d')} (tra {int(stockout_days)} giorni)")
+
+        st.markdown("---")
+        # Grafici (settimanale / mensile)
+        c1, c2 = st.columns(2)
+        with c1:
+            chart_w = create_forecast_chart(daily_sales_show, forecast_show, name_show, freq=freq)
+            st.plotly_chart(chart_w, use_container_width=True)
+        with c2:
+            # Mostra anche split canale (sovrapposto): qui faccio storico B2B/B2C e forecast B2B/B2C come due linee
+            hist_b2b, fc_b2b = _aggregate_series_for_display(daily_b2b_show, forecast_b2b_show, freq=freq)
+            hist_b2c, fc_b2c = _aggregate_series_for_display(daily_b2c_show, forecast_b2c_show, freq=freq)
+            fig_split = go.Figure()
+            fig_split.add_trace(go.Scatter(x=hist_b2b.index, y=hist_b2b.values, mode='lines+markers', name=f'B2B Storico ({ "Settimana" if freq=="W" else "Mese" })'))
+            fig_split.add_trace(go.Scatter(x=fc_b2b.index, y=fc_b2b.values, mode='lines', name=f'B2B Prev ({ "Settimana" if freq=="W" else "Mese" })', line=dict(dash='dash')))
+            fig_split.add_trace(go.Scatter(x=hist_b2c.index, y=hist_b2c.values, mode='lines+markers', name=f'B2C Storico ({ "Settimana" if freq=="W" else "Mese" })'))
+            fig_split.add_trace(go.Scatter(x=fc_b2c.index, y=fc_b2c.values, mode='lines', name=f'B2C Prev ({ "Settimana" if freq=="W" else "Mese" })', line=dict(dash='dash')))
+            fig_split.update_layout(
+                title=f'{name_show} – Storico & Previsione per Canale ({ "Settimanale" if freq=="W" else "Mensile" })',
+                xaxis_title='Periodo', yaxis_title='Unità', hovermode='x unified', height=480, showlegend=True
+            )
+            st.plotly_chart(fig_split, use_container_width=True)
+
+        colh1, colh2 = st.columns(2)
+        with colh1:
+            st.subheader(translations['it']['historical_data'])
+            # storico compatto: mostra ultimi 12 punti della serie aggregata scelta
+            hist_for_table, _ = _aggregate_series_for_display(daily_sales_show, forecast_show, freq=freq)
+            hist_df = hist_for_table.tail(12).reset_index()
+            hist_df.columns = ['Periodo', 'Vendite']
+            hist_df['Periodo'] = hist_df['Periodo'].dt.strftime('%Y-%m-%d')
+            st.dataframe(hist_df, use_container_width=True, hide_index=True)
+        with colh2:
+            st.subheader(translations['it']['forecast'])
+            _, fc_for_table = _aggregate_series_for_display(daily_sales_show, forecast_show, freq=freq)
+            if fc_for_table is not None and len(fc_for_table) > 0:
+                fc_df = fc_for_table.head(12).reset_index()
+                fc_df.columns = ['Periodo', 'Previsione']
+                fc_df['Previsione'] = fc_df['Previsione'].round().astype(int)
+                fc_df['Periodo'] = fc_df['Periodo'].dt.strftime('%Y-%m-%d')
+                st.dataframe(fc_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("Dati insufficienti per la previsione")
+
+# --- avvio ---
 APP_NAME = os.getenv("APP_NAME", "SmallGiants App")
 NAMES = [os.getenv("APP_USER", "SG")]
 USERNAMES = [os.getenv("APP_USERNAME", "SG")]
@@ -1476,10 +1414,8 @@ PLAINTEXT_PASSWORD = os.getenv("APP_PASSWORD", "change-me-now")
 COOKIE_NAME = os.getenv("COOKIE_NAME", "sg_cookie")
 COOKIE_KEY = os.getenv("COOKIE_KEY", "set-a-long-random-key")
 
-
 if __name__ == "__main__":
     if not st.session_state.get("_auth_ok", False):
         gate()
     else:
         main()
-
