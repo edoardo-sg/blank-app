@@ -1545,6 +1545,9 @@ def main():
         st.markdown('<a id="riepilogo-prodotti"></a>', unsafe_allow_html=True)
         st.markdown("### 📊 Riepilogo Prodotti")
 
+        # 🔎 Ricerca veloce nella griglia (nome o SKU)
+        search_txt = st.text_input("Cerca prodotto", value="", placeholder="Es. bites", key="grid_quick_filter")
+
         # Mappa stato ed etichette
         status_map = {'critical':'🔴 Critico','warning':'🟡 Attenzione','good':'🟢 OK'}
         results_df['status'] = results_df['status'].map(status_map)
@@ -1579,9 +1582,8 @@ def main():
 
         # Costruisci le opzioni Ag-Grid
         gb = GridOptionsBuilder.from_dataframe(show_df)
-
-        # Tutte le colonne ridimensionabili
-        gb.configure_default_column(resizable=True)
+        # Colonne: resize + filtro base + barra filtro flottante
+        gb.configure_default_column(resizable=True, filter=True, floatingFilter=True)
 
         # SKU: si adatta (NO suppress), allineamento a sinistra
         gb.configure_column("SKU", pinned=None, suppressSizeToFit=False)
@@ -1633,6 +1635,9 @@ def main():
             """)
         )
 
+        # Quick filter testuale di Ag-Grid (cerca su tutte le colonne visibili)
+        gb.configure_grid_options(quickFilterText=search_txt)
+
         grid_options = gb.build()
 
 
@@ -1669,10 +1674,12 @@ def main():
 
 
         # Memorizza la selezione corrente
-        sku_show  = (selected_row[0].get("SKU") or selected_row[0].get("sku"))
-        st.session_state['selected_sku'] = sku_show
-        name_show = (selected_row[0].get("Nome Prodotto") or selected_row[0].get("name"))
+        sku_show  = selected_row.get("SKU") or selected_row.get("sku")
+        name_show = selected_row.get("Nome Prodotto") or selected_row.get("name")
 
+        if not sku_show:
+            st.error(f"Chiavi disponibili nella riga selezionata: {list(selected_row.keys())}")
+            st.stop()
 
         # Leggi eventuali modifiche a MOQ/Lead Time e salvale come prima
         edited_df = pd.DataFrame(grid_response["data"])
