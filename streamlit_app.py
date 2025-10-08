@@ -7,47 +7,45 @@ from datetime import datetime
 def _drive_client():
     from pydrive2.auth import GoogleAuth
     from pydrive2.drive import GoogleDrive
+    import json
 
-    # Folder ID
-    folder_id = (
-        st.secrets.get("GDRIVE_FOLDER_ID")
-        or os.getenv("GDRIVE_FOLDER_ID")
-    )
+    folder_id = (st.secrets.get("GDRIVE_FOLDER_ID") or os.getenv("GDRIVE_FOLDER_ID"))
     if not folder_id:
         raise RuntimeError("GDRIVE_FOLDER_ID non trovato in st.secrets o env")
 
-    # Email da impersonare (se usi Domain-wide Delegation)
-    subject = (
-        st.secrets.get("IMPERSONATE_EMAIL")
-        or os.getenv("IMPERSONATE_EMAIL")
-    )
+    subject = (st.secrets.get("IMPERSONATE_EMAIL") or os.getenv("IMPERSONATE_EMAIL"))
 
-    # Service Account: preferisci la sezione TOML [google_sa] (già dict)
+    # --- carica credenziali SA ---
     sa_dict = None
     if "google_sa" in st.secrets:
-        sa_dict = dict(st.secrets["google_sa"])
+        sa_dict = dict(st.secrets["google_sa"])          # già dict
     else:
-        # fallback: variabile GDRIVE_SA_JSON può essere stringa JSON o già dict
         sa_json = st.secrets.get("GDRIVE_SA_JSON") or os.getenv("GDRIVE_SA_JSON")
         if not sa_json:
             raise RuntimeError("Credenziali SA non trovate: definisci [google_sa] o GDRIVE_SA_JSON")
         if isinstance(sa_json, str):
-            sa_dict = json.loads(sa_json)  # qui è stringa -> parse
+            # è già stringa JSON → usala così com'è
+            client_json_str = sa_json
         elif isinstance(sa_json, dict):
-            sa_dict = sa_json              # è già dict -> usa così com'è
+            # è dict → DUMPS a stringa JSON
+            client_json_str = json.dumps(sa_json)
         else:
             raise RuntimeError("GDRIVE_SA_JSON deve essere stringa JSON o dict")
+
+    # se avevi [google_sa], serializza a stringa JSON qui
+    if sa_dict is not None:
+        client_json_str = json.dumps(sa_dict)
 
     settings = {
         "client_config_backend": "service",
         "service_config": {
-            "client_json": sa_dict,
+            # 👉 PyDrive2 vuole una STRINGA JSON
+            "client_json": client_json_str
         },
         "oauth_scope": ["https://www.googleapis.com/auth/drive"]
     }
-    # Impersonation (se impostato)
     if subject:
-        settings["service_config"]["client_user_email"] = subject
+        settings["service_config"]["client_user_email"] = subject  # impersonation
 
     gauth = GoogleAuth(settings=settings)
     gauth.ServiceAuth()
