@@ -7,31 +7,36 @@ from datetime import datetime
 def _drive_client():
     from pydrive2.auth import GoogleAuth
     from pydrive2.drive import GoogleDrive
-    import base64
 
-    # prova: ENV → secrets → None
-    sa_val = os.getenv("GDRIVE_SA_JSON", None)
+    # Leggi secrets o env
+    sa_val = st.secrets.get("GDRIVE_SA_JSON", os.environ.get("GDRIVE_SA_JSON"))
+    folder_id = st.secrets.get("GDRIVE_FOLDER_ID", os.environ.get("GDRIVE_FOLDER_ID"))
+
     if not sa_val:
-        # st.secrets può restituire stringa OPPURE dict
-        sa_val = st.secrets.get("GDRIVE_SA_JSON", None)
+        raise RuntimeError("GDRIVE_SA_JSON non trovato in st.secrets o env")
+    if not folder_id:
+        raise RuntimeError("GDRIVE_FOLDER_ID non trovato in st.secrets o env")
 
+    # Normalizza in dict
     if isinstance(sa_val, dict):
         sa_dict = sa_val
-    else:
-        # è una stringa: può essere JSON diretto o base64 del JSON
-        if sa_val.strip().startswith("{"):
-            sa_dict = json.loads(sa_val)
+    elif isinstance(sa_val, str):
+        s = sa_val.strip()
+        if s.startswith("{"):
+            sa_dict = json.loads(s)
         else:
-            sa_dict = json.loads(base64.b64decode(sa_val).decode("utf-8"))
-
-    # folder id: ENV prima, poi secrets
-    folder_id = os.getenv("GDRIVE_FOLDER_ID", None) or st.secrets["GDRIVE_FOLDER_ID"]
+            # opzionale: se hai messo un path a file JSON
+            if os.path.isfile(s):
+                with open(s, "r", encoding="utf-8") as fh:
+                    sa_dict = json.load(fh)
+            else:
+                raise ValueError("GDRIVE_SA_JSON deve essere JSON string o dict, ricevuto stringa non-JSON")
+    else:
+        raise ValueError("GDRIVE_SA_JSON deve essere stringa JSON o dict")
 
     gauth = GoogleAuth(settings={
         "client_config_backend": "service",
-        "service_config": {
-            "client_json": sa_dict
-        },
+        "service_config": {"client_json": sa_dict},
         "oauth_scope": ["https://www.googleapis.com/auth/drive"]
     })
     gauth.ServiceAuth()
@@ -43,10 +48,26 @@ def _sha1(b: bytes) -> str:
     return hashlib.sha1(b).hexdigest()[:10]
 
 def gdrive_upload_bytes(name: str, data: bytes, mime: str):
+    import tempfile
     drive, folder_id = _drive_client()
-    f = drive.CreateFile({"title": name, "parents": [{"id": folder_id}], "mimeType": mime})
-    f.SetContentBinary(data)          # << corretto
-    f.Upload()
+    f = drive.CreateFile({
+        "title": name,
+        "parents": [{"id": folder_id}],
+        "mimeType": mime
+    })
+    # Scrivi su file temporaneo e carica
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        tmp.write(data)
+        tmp.flush()
+        tmp_path = tmp.name
+    try:
+        f.SetContentFile(tmp_path)
+        f.Upload()
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
     return f["id"], f["title"]
 
 def gdrive_list_folder():
@@ -100,10 +121,10 @@ def _load_manifest() -> dict:
     mf_id = _find_manifest()
     if not mf_id:
         return {}
-    drive, _ = _drive_client()
-    f = drive.CreateFile({"id": mf_id})
-    raw = f.GetContentString()
+    raw = gdrive_get_file_content(mf_id)
     try:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
         return json.loads(raw)
     except Exception:
         return {}
