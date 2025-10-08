@@ -1545,8 +1545,13 @@ def main():
         st.markdown('<a id="riepilogo-prodotti"></a>', unsafe_allow_html=True)
         st.markdown("### 📊 Riepilogo Prodotti")
 
-        # 🔎 Ricerca veloce nella griglia (nome o SKU)
-        search_txt = st.text_input("Cerca prodotto", value="", placeholder="Es. bites", key="grid_quick_filter")
+        # 🔎 Cerca per nome prodotto (server-side)
+        search_name = st.text_input(
+            "Cerca per nome prodotto",
+            value="",
+            placeholder="es. bites",
+            key="df_filter_by_name"
+        )
 
         # Mappa stato ed etichette
         status_map = {'critical':'🔴 Critico','warning':'🟡 Attenzione','good':'🟢 OK'}
@@ -1580,23 +1585,36 @@ def main():
             'lead_time': 'Lead Time'
         })
 
+        # Applica filtro solo su Nome Prodotto
+        if search_name:
+            mask = show_df["Nome Prodotto"].astype(str).str.contains(search_name, case=False, na=False)
+            show_df = show_df[mask].reset_index(drop=True)
+
+            # Se la selezione salvata non è più visibile, azzero
+            if st.session_state.get('selected_sku') and st.session_state['selected_sku'] not in set(show_df['SKU']):
+                st.session_state.pop('selected_sku', None)
+                st.session_state.pop('selected_name', None)
+
+
         # Costruisci le opzioni Ag-Grid
         gb = GridOptionsBuilder.from_dataframe(show_df)
-        # Colonne: resize + filtro base + barra filtro flottante
-        gb.configure_default_column(resizable=True, filter=True, floatingFilter=True)
+        # Default: niente filtri sulle colonne
+        gb.configure_default_column(resizable=True, filter=False, floatingFilter=False)
+
 
         # SKU: si adatta (NO suppress), allineamento a sinistra
         gb.configure_column("SKU", pinned=None, suppressSizeToFit=False)
 
-        # Nome Prodotto: l’unica NON “fit”. Wrap + altezza auto
         gb.configure_column(
             "Nome Prodotto",
             pinned="left",
-            suppressSizeToFit=True,   # <- unica col non “fit”
+            suppressSizeToFit=True,
             wrapText=True,
             autoHeight=True,
             headerTooltip="Nome Prodotto",
-            cellStyle={"white-space": "normal"}
+            cellStyle={"white-space": "normal"},
+            filter="agTextColumnFilter",     # ← filtro SOLO su questa colonna
+            floatingFilter=True
         )
 
         # Tutte le altre colonne si adattano con flex
@@ -1634,9 +1652,6 @@ def main():
                 }
             """)
         )
-
-        # Quick filter testuale di Ag-Grid (cerca su tutte le colonne visibili)
-        gb.configure_grid_options(quickFilterText=search_txt)
 
         grid_options = gb.build()
 
