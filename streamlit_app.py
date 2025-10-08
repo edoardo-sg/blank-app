@@ -1,3 +1,116 @@
+import io, os, json, hashlib
+import pandas as pd
+import streamlit as st
+from datetime import datetime
+
+# --- Google Drive via Service Account (PyDrive2) ---
+def _drive_client():
+    from pydrive2.auth import GoogleAuth
+    from pydrive2.drive import GoogleDrive
+
+    sa_json = st.secrets["GDRIVE_SA_JSON"]
+    folder_id = st.secrets["GDRIVE_FOLDER_ID"]
+
+    gauth = GoogleAuth(settings={
+        "client_config_backend": "service",
+        "service_config": {
+            "client_json": json.loads(sa_json)
+        },
+        "oauth_scope": ["https://www.googleapis.com/auth/drive"]
+    })
+    gauth.ServiceAuth()
+    drive = GoogleDrive(gauth)
+    return drive, folder_id
+
+def _sha1(b: bytes) -> str:
+    return hashlib.sha1(b).hexdigest()[:10]
+
+def gdrive_upload_bytes(name: str, data: bytes, mime: str):
+    drive, folder_id = _drive_client()
+    f = drive.CreateFile({"title": name, "parents": [{"id": folder_id}]})
+    f.Upload({"mimeType": mime, "data": io.BytesIO(data)})
+    return f["id"], f["title"]
+
+def gdrive_list_folder():
+    drive, folder_id = _drive_client()
+    q = f"'{folder_id}' in parents and trashed=false"
+    return drive.ListFile({"q": q}).GetList()
+
+def gdrive_get_file_content(file_id: str) -> bytes:
+    drive, _ = _drive_client()
+    f = drive.CreateFile({"id": file_id})
+    return f.GetContentBinary()
+
+# --- Manifest (file JSON nella cartella Drive) ---
+_MANIFEST_NAME = "manifest.json"
+
+def _find_manifest():
+    items = gdrive_list_folder()
+    for it in items:
+        if it["title"] == _MANIFEST_NAME:
+            return it["id"]
+    return None
+
+def _load_manifest() -> dict:
+    mf_id = _find_manifest()
+    if not mf_id:
+        return {}
+    raw = gdrive_get_file_content(mf_id)
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return {}
+
+def _save_manifest(man: dict):
+    # sovrascrive/crea manifest.json
+    payload = json.dumps(man, indent=2).encode("utf-8")
+    mf_id = _find_manifest()
+    if mf_id:
+        # update
+        drive, _ = _drive_client()
+        f = drive.CreateFile({"id": mf_id})
+        f.SetContentBinary(payload)
+        f.Upload()
+    else:
+        # create
+        gdrive_upload_bytes(_MANIFEST_NAME, payload, "application/json")
+
+def save_uploaded_file_drive(uploaded_file, kind: str) -> dict:
+    """
+    kind: "movements" | "stock"
+    Ritorna dict con metadata {file_id, title, uploaded_at_utc, orig_name, size_bytes, kind}
+    """
+    raw = uploaded_file.getvalue()
+    ext = uploaded_file.name.split(".")[-1].lower()
+    ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    h = _sha1(raw)
+    title = f"{kind}_{ts}_{h}.{ext}"
+
+    mime = "text/csv" if ext == "csv" else \
+           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    file_id, _ = gdrive_upload_bytes(title, raw, mime)
+
+    man = _load_manifest()
+    rec = {
+        "file_id": file_id,
+        "title": title,
+        "uploaded_at_utc": ts,
+        "orig_name": uploaded_file.name,
+        "size_bytes": len(raw),
+        "kind": kind,
+        "ext": ext
+    }
+    man[kind] = rec
+    _save_manifest(man)
+    return rec
+
+def get_last_saved_drive(kind: str) -> dict | None:
+    man = _load_manifest()
+    return man.get(kind)
+
+
+
+
 import sys
 print("USING PYTHON:", sys.executable)
 
@@ -921,6 +1034,21 @@ def main():
             help="File con stock: SKU interno, Q.tà disponibile, Q.tà in stock, ecc.",
             key="stock_file"
         )
+
+        # --- Drive actions per MOVIMENTI ---
+        col_m1, col_m2 = st.columns(2)
+        with col_m1:
+            use_last_mov = st.button("⬇️ Usa ultimo movimenti (Drive)", key="use_last_mov")
+        with col_m2:
+            save_mov = st.button("⬆️ Salva movimenti su Drive", key="save_mov")
+
+        # --- Drive actions per STOCK ---
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            use_last_stock = st.button("⬇️ Usa ultimo stock (Drive)", key="use_last_stock")
+        with col_s2:
+            save_stock = st.button("⬆️ Salva stock su Drive", key="save_stock")
+
         st.markdown("### ⚙️ Parametri")
         forecast_days = st.slider(t['forecast_days'], 30, 365, 90)
         safety_stock_days = st.slider(t['safety_stock'], 7, 30, 14)
@@ -930,26 +1058,41 @@ def main():
         safety_margin = st.slider("Margine di Sicurezza (%)", 0, 50, 10) / 100
 
         st.markdown("### 📈 Visualizzazione")
-        view_freq = st.radio("Granularità grafici", options=["Settimanale", "Mensile"], index=0, horizontal=True)
-        freq = 'W' if view_freq == "Settimanale" else 'M'
+        view_freq = st.radio("Granularità grafici", options=["Mensile","Settimanale"], index=0, horizontal=True)
+        freq = 'M' if view_freq == "Mensile" else 'W'
 
     st.markdown(f"<h1 class='main-header'>{t['title']}</h1>", unsafe_allow_html=True)
     # Link rapido per saltare al riepilogo, prima dell’elaborazione
     st.markdown('<p><a href="#riepilogo-prodotti">⬇️ Vai al Riepilogo Prodotti</a></p>', unsafe_allow_html=True)
 
-    if uploaded_file is None:
+    # Se non c'è file movimenti e non ho chiesto "usa ultimo", mostro benvenuto
+    if uploaded_file is None and not ('use_last_mov' in locals() and use_last_mov):
         st.markdown("""
         ## 👋 Benvenuto nel Sistema di Previsione Inventario
 
         1. Carica movimenti
-        2. Carica stock
-        3. Analizza previsioni e raccomandazioni di ordine
+        2. (Opzionale) Carica stock
+        3. Oppure usa i bottoni per **recuperare l'ultimo file** da Drive
+        4. Analizza previsioni e raccomandazioni di ordine
         """)
         return
 
     # ------- Processamento completo -------
     with st.spinner(translations['it']['processing']):
-        # Lettura movimenti
+
+        # === MOVIMENTI: usa ultimo da Drive se richiesto ===
+        if uploaded_file is None and ('use_last_mov' in locals() and use_last_mov):
+            last = get_last_saved_drive("movements")
+            if last:
+                try:
+                    st.info(f"⬇️ Scarico ultimo movimenti da Drive: {last['title']}")
+                    data_bytes = gdrive_get_file_content(last["file_id"])
+                    uploaded_file = io.BytesIO(data_bytes)
+                    uploaded_file.name = last["title"]  # per coerenza con UploadedFile
+                except Exception as e:
+                    st.error(f"Errore nel recupero movimenti da Drive: {e}")
+
+        # --- Lettura MOVIMENTI (da upload o da Drive) ---
         try:
             if uploaded_file.name.endswith('.csv'):
                 try:
@@ -962,17 +1105,54 @@ def main():
                     raw_df = pd.read_csv(uploaded_file, encoding='latin-1', sep=',')
             else:
                 raw_df = pd.read_excel(uploaded_file)
-            st.write(f"📁 **File caricato:** {uploaded_file.name}")
+
+            st.write(f"📁 **File caricato (movimenti):** {uploaded_file.name}")
             st.write(f"📊 **Righe totali:** {len(raw_df)}")
+
             df = process_excel_data(raw_df)
             if df.empty:
-                st.error("❌ Nessun dato valido trovato nel file caricato.")
+                st.error("❌ Nessun dato valido trovato nel file movimenti.")
                 return
+
+            # Se ho cliccato "salva movimenti" → salvo su Drive
+            if 'save_mov' in locals() and save_mov:
+                try:
+                    # recupero i bytes dall'oggetto corrente
+                    if hasattr(uploaded_file, "getvalue"):
+                        data_bytes = uploaded_file.getvalue()
+                    else:
+                        uploaded_file.seek(0)
+                        data_bytes = uploaded_file.read()
+
+                    # creo un "UploadedFile" fittizio solo per passare a save_uploaded_file_drive
+                    class _MemUp:
+                        def __init__(self, data, name):
+                            self._d = data; self.name = name
+                        def getvalue(self): return self._d
+
+                    mem_up = _MemUp(data_bytes, uploaded_file.name)
+                    rec = save_uploaded_file_drive(mem_up, "movements")
+                    st.success(f"✅ Movimenti salvati su Drive come **{rec['title']}**")
+                except Exception as e:
+                    st.error(f"Errore salvataggio movimenti su Drive: {e}")
+
         except Exception as e:
-            st.error(f"Errore durante l'elaborazione del file: {str(e)}")
+            st.error(f"Errore durante l'elaborazione del file movimenti: {str(e)}")
             return
 
-        # Lettura stock UNA SOLA VOLTA
+        # === STOCK: usa ultimo da Drive se richiesto ===
+        if stock_file is None and ('use_last_stock' in locals() and use_last_stock):
+            last_s = get_last_saved_drive("stock")
+            if last_s:
+                try:
+                    st.info(f"⬇️ Scarico ultimo stock da Drive: {last_s['title']}")
+                    s_bytes = gdrive_get_file_content(last_s["file_id"])
+                    stock_file = io.BytesIO(s_bytes)
+                    stock_file.name = last_s["title"]
+                except Exception as e:
+                    st.error(f"Errore nel recupero stock da Drive: {e}")
+
+        # --- Lettura STOCK (se presente) ---
         stock_info = pd.DataFrame()
         if stock_file is not None:
             try:
@@ -987,15 +1167,35 @@ def main():
                         stock_raw_df = pd.read_csv(stock_file, encoding='latin-1', sep=',')
                 else:
                     stock_raw_df = pd.read_excel(stock_file)
-                # pulizia intestazioni da BOM
+
                 stock_raw_df.columns = [str(c).strip().replace('\ufeff','') for c in stock_raw_df.columns]
-                st.write(f"📋 Colonne trovate nel file stock: {list(stock_raw_df.columns)}")
-                st.write(f"📊 Righe nel file stock: {len(stock_raw_df)}")
+                st.write(f"📋 **Colonne stock trovate:** {list(stock_raw_df.columns)}")
+                st.write(f"📊 **Righe stock:** {len(stock_raw_df)}")
+
                 stock_info = process_stock_file(stock_raw_df)
+
+                # Se ho cliccato "salva stock" → salvo su Drive
+                if 'save_stock' in locals() and save_stock:
+                    if hasattr(stock_file, "getvalue"):
+                        s_bytes = stock_file.getvalue()
+                    else:
+                        stock_file.seek(0)
+                        s_bytes = stock_file.read()
+
+                    class _MemUpS:
+                        def __init__(self, data, name):
+                            self._d = data; self.name = name
+                        def getvalue(self): return self._d
+
+                    mem_up_s = _MemUpS(s_bytes, stock_file.name)
+                    rec_s = save_uploaded_file_drive(mem_up_s, "stock")
+                    st.success(f"✅ Stock salvato su Drive come **{rec_s['title']}**")
+
             except Exception as e:
                 st.error(f"Errore nel processare il file stock: {str(e)}")
-                st.info("Procedo senza stock file.")
+                st.info("Procedo senza file stock.")
                 stock_info = pd.DataFrame()
+
 
         # Attivi: movimenti ultimi 12 mesi o stock presente
         active_products = []
@@ -1085,6 +1285,8 @@ def main():
             central_b2c   = get_central_forecast_series(forecast_b2c)
             # B2B = Totale - B2C, mai negativo
             central_b2b   = (central_total - central_b2c).clip(lower=0)
+            # Prev Tot sulla base del numero di giorni scelto nello slider
+            forecast_tot = int(central_total.head(forecast_days).sum()) if not central_total.empty else 0
 
             # settings: moq e lead time
             if not product_settings[product_settings['sku'] == str(sku)].empty:
@@ -1115,14 +1317,9 @@ def main():
                 'sku': sku,
                 'name': product_name,
                 'current_stock': int(current_stock),
-                'forecast_30d_total': int(central_total[:30].sum()) if not central_total.empty else 0,
-                'forecast_30d_b2b': f30_b2b,
-                'forecast_30d_b2c': f30_b2c,
-                'forecast_90d_total': int(central_total[:90].sum()) if not central_total.empty else 0,
-                'forecast_90d_b2b': f90_b2b,
-                'forecast_90d_b2c': f90_b2c,
-                'qty_reserved': int(qty_reserved),
-                'qty_incoming': int(qty_incoming),
+                'forecast_tot': int(forecast_tot),            # <-- nuovo campo unico
+                'qty_reserved': int(qty_reserved),            # resta disponibile per i dettagli
+                'qty_incoming': int(qty_incoming),            # resta disponibile per i dettagli
                 'status': status,
                 'units_to_order': int(units_to_order),
                 'monthly_avg': int(round(avg_monthly)),
@@ -1137,29 +1334,38 @@ def main():
         st.markdown('<a id="riepilogo-prodotti"></a>', unsafe_allow_html=True)
         st.markdown("### 📊 Riepilogo Prodotti")
 
-        # Mappa stato con emoji e rinomina colonne come prima
+        # Mappa stato ed etichette
         status_map = {'critical':'🔴 Critico','warning':'🟡 Attenzione','good':'🟢 OK'}
         results_df['status'] = results_df['status'].map(status_map)
 
-        show_df = results_df.rename(columns={
+        # Etichetta dinamica per la previsione totale (basata sullo slider)
+        prev_col_label = f"Prev Tot ({forecast_days} gg)"
+
+        # Seleziona SOLO le colonne richieste
+        show_df = results_df[[
+            'sku',
+            'name',
+            'current_stock',
+            'forecast_tot',
+            'monthly_avg',
+            'last_month_avg',
+            'status',
+            'units_to_order',
+            'moq',
+            'lead_time'
+        ]].rename(columns={
             'sku': 'SKU',
             'name': 'Nome Prodotto',
             'current_stock': 'Stock Attuale',
-            'forecast_30d_total': 'Prev 30gg (Tot)',
-            'forecast_30d_b2b': 'Prev 30gg B2B',
-            'forecast_30d_b2c': 'Prev 30gg B2C',
-            'forecast_90d_total': 'Prev 90gg (Tot)',
-            'forecast_90d_b2b': 'Prev 90gg B2B',
-            'forecast_90d_b2c': 'Prev 90gg B2C',
-            'qty_reserved': 'Prenotate',
-            'qty_incoming': 'In Arrivo',
-            'status': 'Stato',
-            'units_to_order': 'Da Ordinare',
+            'forecast_tot': prev_col_label,           # <-- colonna “Prev Tot”
             'monthly_avg': 'Media Mensile',
             'last_month_avg': 'Media Ultimo Mese',
+            'status': 'Stato',
+            'units_to_order': 'Da Ordinare',
             'moq': 'MOQ',
             'lead_time': 'Lead Time'
         })
+
 
         # Costruisci le opzioni Ag-Grid
         gb = GridOptionsBuilder.from_dataframe(show_df)
