@@ -50,6 +50,14 @@ def _drive_client():
     gauth = GoogleAuth(settings=settings)
     gauth.ServiceAuth()
     drive = GoogleDrive(gauth)
+
+        # 👇 Diagnostica: chi sono?
+    try:
+        about = drive.GetAbout()
+        st.info(f"🔐 Autenticato come: {about.get('user', {}).get('emailAddress', 'sconosciuto')}")
+    except Exception as e:
+        st.warning(f"Impossibile leggere About: {e}")
+        
     return drive, folder_id
 
 
