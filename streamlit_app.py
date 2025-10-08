@@ -52,15 +52,26 @@ def _sha1(b: bytes) -> str:
     return hashlib.sha1(b).hexdigest()[:10]
 
 def gdrive_upload_bytes(name: str, data: bytes, mime: str):
+    from pydrive2.auth import GoogleAuth
+    from pydrive2.drive import GoogleDrive
+    import tempfile
+
     drive, folder_id = _drive_client()
     f = drive.CreateFile({
         "title": name,
         "parents": [{"id": folder_id}],
         "mimeType": mime
     })
-    f.SetContentBinary(data)
+
+    # Scrivi i bytes su un file temporaneo e caricalo
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        tmp.write(data)
+        tmp.flush()
+        f.SetContentFile(tmp.name)
+
     f.Upload()
     return f["id"], f["title"]
+
 
 
 def gdrive_list_folder():
@@ -88,27 +99,24 @@ def _find_manifest():
     return None
 
 def _save_manifest(man: dict):
-    import json
-    # JSON → bytes UTF-8 (niente ASCII escaping)
-    payload = json.dumps(man, ensure_ascii=False, indent=2).encode("utf-8")
+    # serializza in UTF-8 senza escape ASCII e carica come stringa
+    payload_str = json.dumps(man, ensure_ascii=False, indent=2)
 
     drive, folder_id = _drive_client()
     mf_id = _find_manifest()
 
     if mf_id:
-        # aggiorna esistente e assicura mimeType
         f = drive.CreateFile({"id": mf_id, "mimeType": "application/json"})
     else:
-        # crea nuovo
         f = drive.CreateFile({
             "title": _MANIFEST_NAME,
             "parents": [{"id": folder_id}],
             "mimeType": "application/json",
         })
 
-    # salva come binario (più robusto di SetContentString)
-    f.SetContentBinary(payload)
+    f.SetContentString(payload_str)
     f.Upload()
+
 
 def _load_manifest() -> dict:
     mf_id = _find_manifest()
