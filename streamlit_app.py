@@ -7,9 +7,8 @@ from datetime import datetime
 def _drive_client():
     from pydrive2.auth import GoogleAuth
     from pydrive2.drive import GoogleDrive
-    import json
+    import json, os, streamlit as st
 
-    # 1) Folder ID
     folder_id = (
         st.secrets.get("GDRIVE_FOLDER_ID")
         or os.getenv("GDRIVE_FOLDER_ID")
@@ -17,31 +16,36 @@ def _drive_client():
     if not folder_id:
         raise RuntimeError("GDRIVE_FOLDER_ID non trovato in st.secrets o env")
 
-    # 2) Credenziali SA: accetta [google_sa] (TOML) o GDRIVE_SA_JSON (stringa)
-    sa_json_str = None
-
-    # Caso A: sezione TOML [google_sa] -> convertila in stringa JSON
+    # --- credenziali SA: sezione TOML [google_sa] oppure stringa JSON ---
     if "google_sa" in st.secrets:
         sa_dict = dict(st.secrets["google_sa"])
-        sa_json_str = json.dumps(sa_dict)   # <-- PyDrive2 vuole STRINGA, non dict
-
-    # Caso B: variabile/stringa GDRIVE_SA_JSON
-    if sa_json_str is None:
-        sa_raw = st.secrets.get("GDRIVE_SA_JSON") or os.getenv("GDRIVE_SA_JSON")
-        if not sa_raw:
+    else:
+        sa_json = st.secrets.get("GDRIVE_SA_JSON") or os.getenv("GDRIVE_SA_JSON")
+        if not sa_json:
             raise RuntimeError("Credenziali SA non trovate: definisci [google_sa] o GDRIVE_SA_JSON")
-        # Se è già stringa, usala; se è dict (raro), serializzalo
-        if isinstance(sa_raw, dict):
-            sa_json_str = json.dumps(sa_raw)
-        else:
-            sa_json_str = str(sa_raw)
+        sa_dict = json.loads(sa_json) if isinstance(sa_json, str) else sa_json
+
+    # --- ⚠️ importantissimo: email dell'utente da IMPERSONARE (subject) ---
+    # Mettila in st.secrets["IMPERSONATE_USER"] o env IMPERSONATE_USER
+    user_to_impersonate = (
+        st.secrets.get("IMPERSONATE_USER")
+        or os.getenv("IMPERSONATE_USER")
+    )
+    if not user_to_impersonate:
+        raise RuntimeError("IMPERSONATE_USER mancante (utente Workspace da impersonare)")
 
     gauth = GoogleAuth(settings={
         "client_config_backend": "service",
         "service_config": {
-            "client_json": sa_json_str  # <-- STRINGA JSON
+            # credenziali SA
+            "client_json": sa_dict,
+            # <-- QUI la delega a livello di dominio: utente impersonato
+            "client_user_email": user_to_impersonate,
         },
-        "oauth_scope": ["https://www.googleapis.com/auth/drive"]
+        "oauth_scope": [
+            "https://www.googleapis.com/auth/drive",
+            "https://www.googleapis.com/auth/drive.file",
+        ],
     })
     gauth.ServiceAuth()
     drive = GoogleDrive(gauth)
