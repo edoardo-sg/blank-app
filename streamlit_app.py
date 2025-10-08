@@ -1258,10 +1258,94 @@ def _bytes_key(b: bytes) -> str:
 
 @st.cache_data
 def _compute_all(results_key: str, df_mov: pd.DataFrame, stock_info: pd.DataFrame, forecast_days: int, safety_stock_days: int, safety_margin: float):
-    """Wrap di computazioni pesanti per evitare restart al click."""
-    # Qui puoi riportare la tua pipeline di calcolo (global growth, loop prodotti, ecc.)
-    # Ritorna tutto ciò che serve a main() (es. results_df già pronto)
-    return {}
+    # Qui metti il calcolo di:
+    # - products_df
+    # - results_df (tabella riepilogo)
+    # - all_sales_data (serie globale)
+    # Ritorna un dict con questi oggetti pronti.
+    # NB: NON usare st.* qui dentro.
+    twelve_months_ago = datetime.now() - timedelta(days=365)
+
+    active_products = []
+    for sku in df_mov['sku'].unique():
+        pd_sku = df_mov[df_mov['sku']==sku].copy().sort_values('date')
+        pd_sku.set_index('date', inplace=True)
+        recent = pd_sku[pd_sku.index >= twelve_months_ago]['units_sold'].sum()
+        cur, _, _ = get_stock_fields(stock_info, sku)
+        if cur > 0 or recent > 0:
+            name = pd_sku['product_name'].iloc[0] if 'product_name' in pd_sku.columns else f"Prodotto {sku}"
+            active_products.append({'sku': sku, 'name': name, 'current_stock': int(cur), 'recent_movements': int(recent)})
+
+    products_df = pd.DataFrame(active_products)
+
+    # tasso crescita globale
+    all_sales_data = df_mov.copy().sort_values('date').set_index('date')
+    global_series = all_sales_data.groupby(all_sales_data.index)['units_sold'].sum()
+    global_growth = calculate_growth_rate(global_series, None)
+
+    # costruisci results_df come nel tuo loop attuale (puoi riusare il codice invariato),
+    # ma SENZA st.write e st.*; restituisci il DataFrame finale.
+    results = []
+    product_settings = load_product_settings()
+
+    for _, prow in products_df.iterrows():
+        sku = prow['sku']; product_name = prow['name']
+        product_data = df_mov[df_mov['sku']==sku].copy().sort_values('date').set_index('date')
+        daily_sales = product_data['units_sold'].resample('D').sum().fillna(0)
+        if 'units_sold_b2b' in product_data.columns:
+            daily_b2b = product_data['units_sold_b2b'].resample('D').sum().fillna(0)
+            daily_b2c = product_data['units_sold_b2c'].resample('D').sum().fillna(0)
+        else:
+            daily_b2b = pd.Series(0, index=daily_sales.index)
+            daily_b2c = pd.Series(0, index=daily_sales.index)
+
+        current_stock, qty_reserved, qty_incoming = get_stock_fields(stock_info, sku)
+        product_growth = calculate_growth_rate(daily_sales, None)
+        growth_rate = max(product_growth, global_growth)
+
+        all_products_sales = df_mov.copy().set_index('date')
+        forecast_total = forecast_with_prophet(daily_sales, forecast_days, all_products_data=all_products_sales, current_sku=sku)
+
+        central_total = get_central_forecast_series(forecast_total)
+        forecast_tot = int(central_total.head(forecast_days).sum()) if not central_total.empty else 0
+
+        if not product_settings[product_settings['sku'] == str(sku)].empty:
+            product_moq = int(product_settings.loc[product_settings['sku']==str(sku), 'moq'].iloc[0]) if 'moq' in product_settings.columns else 1
+            product_lead_time = int(product_settings.loc[product_settings['sku']==str(sku), 'lead_time'].iloc[0]) if 'lead_time' in product_settings.columns else 7
+        else:
+            product_moq = 1; product_lead_time = 7
+
+        units_to_order, status, details = calculate_order_recommendation(
+            forecast_total, current_stock, safety_stock_days, product_lead_time,
+            qty_incoming=qty_incoming, qty_reserved=qty_reserved,
+            safety_margin=safety_margin, moq=product_moq
+        )
+
+        monthly_stats = calculate_monthly_average_excluding_oos(daily_sales, min_run_days=14)
+        avg_monthly = monthly_stats['monthly_avg']
+        last_month_avg = float(daily_sales.tail(30).mean() * 30)
+
+        results.append({
+            'sku': sku, 'name': product_name,
+            'current_stock': int(current_stock),
+            'forecast_tot': int(forecast_tot),
+            'qty_reserved': int(qty_reserved),
+            'qty_incoming': int(qty_incoming),
+            'status': status,
+            'units_to_order': int(units_to_order),
+            'monthly_avg': int(round(avg_monthly)),
+            'last_month_avg': int(round(last_month_avg)),
+            'moq': int(product_moq),
+            'lead_time': int(product_lead_time)
+        })
+
+    results_df = pd.DataFrame(results)
+    return {
+        'products_df': products_df,
+        'results_df': results_df,
+        'all_sales_data': all_sales_data
+    }
+
 
 # -------------------------------
 # MAIN
@@ -1344,7 +1428,7 @@ def main():
     want_last_stock = ('use_last_stock' in locals() and use_last_stock)
     want_last_mov   = ('use_last_mov'   in locals() and use_last_mov)
 
-    # --- Persistenza & acquisizione MOVIMENTI (ordini liberi: upload o drive) ---
+    # --- Persistenza & acquisizione MOVIMENTI ---
     if uploaded_file is not None:
         st.session_state['mov_file_bytes'] = uploaded_file.getvalue()
         st.session_state['mov_file_name']  = uploaded_file.name
@@ -1376,10 +1460,8 @@ def main():
 
     # --- Gate: procedi SOLO se ho ENTRAMBI i file in sessione ---
     missing = []
-    if 'mov_file_bytes' not in st.session_state:
-        missing.append("file **Movimenti** (carica o usa l’ultimo da Drive)")
-    if 'stock_file_bytes' not in st.session_state:
-        missing.append("file **Stock** (carica o usa l’ultimo da Drive)")
+    if 'mov_file_bytes' not in st.session_state:  missing.append("file **Movimenti**")
+    if 'stock_file_bytes' not in st.session_state: missing.append("file **Stock**")
 
     if missing:
         st.markdown("## 👋 Benvenuto")
@@ -1387,13 +1469,12 @@ def main():
         for m in missing: st.write(f"• {m}")
         st.stop()
 
-    # --- Ho entrambi: Bytes e nomi “stabili” che non si perdono al rerun ---
+    # --- Ho entrambi: leggo SOLO dai bytes in sessione ---
     mov_bytes   = st.session_state['mov_file_bytes']
     mov_name    = st.session_state['mov_file_name']
     stock_bytes = st.session_state['stock_file_bytes']
     stock_name  = st.session_state['stock_file_name']
 
-    # --- Parsing (CACHE) ENTRAMBI ---
     df = _parse_movements_from_bytes(mov_bytes, mov_name)
     if df.empty:
         st.error("❌ Movimenti non validi."); st.stop()
@@ -1402,42 +1483,27 @@ def main():
     if stock_info.empty:
         st.error("❌ Stock non valido."); st.stop()
 
-    # --- Salvataggio su Drive (se richiesto) usando i bytes persistiti ---
+    # --- Salvataggi su Drive, se richiesti (riusando i bytes in sessione) ---
     if 'save_mov' in locals() and save_mov:
+        class _MemUp: 
+            def __init__(self, d, n): self._d=d; self.name=n
+            def getvalue(self): return self._d
         try:
-            class _MemUp:
-                def __init__(self, data, name): self._d=data; self.name=name
-                def getvalue(self): return self._d
             rec = save_uploaded_file_drive(_MemUp(mov_bytes, mov_name), "movements")
             st.success(f"✅ Movimenti salvati su Drive come **{rec['title']}**")
         except Exception as e:
             st.error(f"Errore salvataggio movimenti su Drive: {e}")
 
     if 'save_stock' in locals() and save_stock:
+        class _MemUpS: 
+            def __init__(self, d, n): self._d=d; self.name=n
+            def getvalue(self): return self._d
         try:
-            class _MemUpS:
-                def __init__(self, data, name): self._d=data; self.name=name
-                def getvalue(self): return self._d
             rec_s = save_uploaded_file_drive(_MemUpS(stock_bytes, stock_name), "stock")
             st.success(f"✅ Stock salvato su Drive come **{rec_s['title']}**")
         except Exception as e:
             st.error(f"Errore salvataggio stock su Drive: {e}")
 
-    st.markdown(f"<h1 class='main-header'>{t['title']}</h1>", unsafe_allow_html=True)
-    # Link rapido per saltare al riepilogo, prima dell’elaborazione
-    st.markdown('<p><a href="#riepilogo-prodotti">⬇️ Vai al Riepilogo Prodotti</a></p>', unsafe_allow_html=True)
-
-    # Se non c'è file movimenti e non ho chiesto "usa ultimo", mostro benvenuto
-    if uploaded_file is None and not ('use_last_mov' in locals() and use_last_mov):
-        st.markdown("""
-        ## 👋 Benvenuto nel Sistema di Previsione Inventario
-
-        1. Carica movimenti
-        2. (Opzionale) Carica stock
-        3. Oppure usa i bottoni per **recuperare l'ultimo file** da Drive
-        4. Analizza previsioni e raccomandazioni di ordine
-        """)
-        return
 
     # ------- Processamento completo -------
     with st.spinner(translations['it']['processing']):
@@ -1559,136 +1625,29 @@ def main():
                 stock_info = pd.DataFrame()
 
 
-        # Attivi: movimenti ultimi 12 mesi o stock presente
-        active_products = []
-        twelve_months_ago = datetime.now() - timedelta(days=365)
+        # === COMPUTE ALL CACHED, PRIMA DELLA TABELLA ===
+        # Key stabile: dipende dai bytes dei file + parametri UI
+        results_key = "|".join([
+            _bytes_key(mov_bytes),
+            _bytes_key(stock_bytes),
+            str(forecast_days),
+            str(safety_stock_days),
+            str(safety_margin)
+        ])
 
-        # df: colonne ['date','sku','product_name','units_sold','units_sold_b2b','units_sold_b2c','on_hand_end']
-        for sku in df['sku'].unique():
-            product_data = df[df['sku'] == sku].copy().sort_values('date')
-            product_data.set_index('date', inplace=True)
-            # vendite in ultimi 12 mesi
-            recent_movements = product_data[product_data.index >= twelve_months_ago]['units_sold'].sum()
+        bundle = _compute_all(
+            results_key,
+            df,            # df movimenti già processato: colonne date/sku/units_sold…
+            stock_info,    # df stock già processato: colonne sku/current_stock/qty_*
+            forecast_days,
+            safety_stock_days,
+            safety_margin
+        )
 
-            current_stock, _, _ = get_stock_fields(stock_info, sku)
-            if current_stock > 0 or recent_movements > 0:
-                product_name = product_data['product_name'].iloc[0] if 'product_name' in product_data.columns else f"Prodotto {sku}"
-                active_products.append({
-                    'sku': sku,
-                    'name': product_name,
-                    'current_stock': int(current_stock),
-                    'recent_movements': int(recent_movements)
-                })
+        products_df   = bundle['products_df']
+        results_df    = bundle['results_df']
+        all_sales_data = bundle['all_sales_data']
 
-        if not active_products:
-            st.warning("❌ Nessun prodotto attivo trovato")
-            return
-
-        products_df = pd.DataFrame(active_products)
-
-        # Calcolo tasso crescita globale una volta
-        try:
-            st.write("🌍 Calcolo tasso di crescita globale...")
-            all_sales_data = df.copy().sort_values('date').set_index('date')
-            global_series = all_sales_data.groupby(all_sales_data.index)['units_sold'].sum()
-            global_growth = calculate_growth_rate(global_series, None)
-            st.write(f"📈 Tasso di crescita globale: {global_growth*100:.1f}%")
-        except Exception as e:
-            st.error(f"Errore nel calcolo del tasso di crescita globale: {str(e)}")
-            global_growth = 0.0
-
-        # Impostazioni prodotto
-        if 'moq_values' not in st.session_state:
-            st.session_state.moq_values = {}
-        product_settings = st.session_state.product_settings
-
-        results = []
-
-        # CICLO PER SKU
-        for _, prow in products_df.iterrows():
-            sku = prow['sku']
-            product_name = prow['name']
-
-            # dataset singolo prodotto
-            product_data = df[df['sku'] == sku].copy().sort_values('date').set_index('date')
-
-            # serie giornaliere (totali + split canale)
-            daily_sales = product_data['units_sold'].resample('D').sum().fillna(0)
-
-            if 'units_sold_b2b' in product_data.columns:
-                daily_b2b = product_data['units_sold_b2b'].resample('D').sum().fillna(0)
-                daily_b2c = product_data['units_sold_b2c'].resample('D').sum().fillna(0)
-            else:
-                daily_b2b = pd.Series(0, index=daily_sales.index)
-                daily_b2c = pd.Series(0, index=daily_sales.index)
-
-            # stock fields
-            current_stock, qty_reserved, qty_incoming = get_stock_fields(stock_info, sku)
-
-            # growth: scegli max tra prodotto e globale
-            product_growth = calculate_growth_rate(daily_sales, None)
-            growth_rate = max(product_growth, global_growth)
-            st.write(f"📊 Confronto tassi crescita per {sku}: Prodotto {product_growth*100:.1f}%, Globale {global_growth*100:.1f}%, Scelto {growth_rate*100:.1f}%")
-
-            # previsioni: totale + per canale
-            all_products_sales = df.copy().set_index('date')
-
-            forecast_total = forecast_with_prophet(daily_sales, forecast_days,
-                                                   all_products_data=all_products_sales,
-                                                   current_sku=sku)
-            forecast_b2b = forecast_with_prophet(daily_b2b, forecast_days,
-                                                 all_products_data=all_products_sales,
-                                                 current_sku=f"{sku}_B2B")
-            forecast_b2c = forecast_with_prophet(daily_b2c, forecast_days,
-                                                 all_products_data=all_products_sales,
-                                                 current_sku=f"{sku}_B2C")
-
-            central_total = get_central_forecast_series(forecast_total)
-            central_b2c   = get_central_forecast_series(forecast_b2c)
-            # B2B = Totale - B2C, mai negativo
-            central_b2b   = (central_total - central_b2c).clip(lower=0)
-            # Prev Tot sulla base del numero di giorni scelto nello slider
-            forecast_tot = int(central_total.head(forecast_days).sum()) if not central_total.empty else 0
-
-            # settings: moq e lead time
-            if not product_settings[product_settings['sku'] == str(sku)].empty:
-                product_moq = int(product_settings.loc[product_settings['sku']==str(sku), 'moq'].iloc[0]) if 'moq' in product_settings.columns else 1
-                product_lead_time = int(product_settings.loc[product_settings['sku']==str(sku), 'lead_time'].iloc[0]) if 'lead_time' in product_settings.columns else 7
-            else:
-                product_moq = 1
-                product_lead_time = 7
-
-            units_to_order, status, details = calculate_order_recommendation(
-                forecast_total, current_stock, safety_stock_days, product_lead_time,
-                qty_incoming=qty_incoming, qty_reserved=qty_reserved,
-                safety_margin=safety_margin, moq=product_moq
-            )
-
-            # media mensile storica (totale)
-            monthly_stats = calculate_monthly_average_excluding_oos(daily_sales, min_run_days=14)
-            avg_monthly = monthly_stats['monthly_avg']
-            last_month_avg = float(daily_sales.tail(30).mean() * 30)
-
-            # forecast 30/90 per canale
-            f30_b2b = int(central_b2b[:30].sum()) if not central_b2b.empty else 0
-            f30_b2c = int(central_b2c[:30].sum()) if not central_b2c.empty else 0
-            f90_b2b = int(central_b2b[:90].sum()) if not central_b2b.empty else 0
-            f90_b2c = int(central_b2c[:90].sum()) if not central_b2c.empty else 0
-
-            results.append({
-                'sku': sku,
-                'name': product_name,
-                'current_stock': int(current_stock),
-                'forecast_tot': int(forecast_tot),            # <-- nuovo campo unico
-                'qty_reserved': int(qty_reserved),            # resta disponibile per i dettagli
-                'qty_incoming': int(qty_incoming),            # resta disponibile per i dettagli
-                'status': status,
-                'units_to_order': int(units_to_order),
-                'monthly_avg': int(round(avg_monthly)),
-                'last_month_avg': int(round(last_month_avg)),
-                'moq': int(product_moq),
-                'lead_time': int(product_lead_time)
-            })
 
         # ------- TABELLA RIEPILOGO (IN ALTO) -------
         results_df = pd.DataFrame(results)
@@ -1790,18 +1749,32 @@ def main():
         grid_response = AgGrid(
             show_df,
             gridOptions=grid_options,
-            update_mode=GridUpdateMode.MODEL_CHANGED,
+            update_mode=GridUpdateMode.SELECTION_CHANGED,  # ← prima era MODEL_CHANGED
             allow_unsafe_jscode=True,
             fit_columns_on_grid_load=False,
             theme="balham",
             height=800,
-            key="main_grid"  # chiave stabile
+            key="main_grid"
         )
 
         # --- Selezione persistita ---
-        sel = grid_response.get("selected_rows", [])
-        if isinstance(sel, pd.DataFrame):
-            sel = sel.to_dict("records")
+        selected_rows = grid_response.get("selected_rows", [])
+        if isinstance(selected_rows, pd.DataFrame):
+            selected_rows = selected_rows.to_dict("records")
+
+        if selected_rows:
+            sku_show  = selected_rows[0].get("SKU") or selected_rows[0].get("sku")
+            name_show = selected_rows[0].get("Nome Prodotto") or selected_rows[0].get("name")
+            st.session_state['selected_sku']  = sku_show
+            st.session_state['selected_name'] = name_show
+        else:
+            sku_show  = st.session_state.get('selected_sku')
+            name_show = st.session_state.get('selected_name')
+
+        if not sku_show:
+            st.info("Seleziona un prodotto nella tabella per vedere il dettaglio.")
+            st.stop()
+
 
         # Se nulla selezionato ma in passato avevamo selezionato, recupera
         if (not sel) and ('selected_sku' in st.session_state):
