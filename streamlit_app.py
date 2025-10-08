@@ -8,13 +8,14 @@ def _drive_client():
     from pydrive2.auth import GoogleAuth
     from pydrive2.drive import GoogleDrive
 
-    sa_json = st.secrets["GDRIVE_SA_JSON"]
+    # prende il dict direttamente dalla sezione [google_sa] nei secrets
+    sa_info = dict(st.secrets["google_sa"])
     folder_id = st.secrets["GDRIVE_FOLDER_ID"]
 
     gauth = GoogleAuth(settings={
         "client_config_backend": "service",
         "service_config": {
-            "client_json": json.loads(sa_json)
+            "client_json": sa_info
         },
         "oauth_scope": ["https://www.googleapis.com/auth/drive"]
     })
@@ -22,13 +23,19 @@ def _drive_client():
     drive = GoogleDrive(gauth)
     return drive, folder_id
 
+
 def _sha1(b: bytes) -> str:
     return hashlib.sha1(b).hexdigest()[:10]
 
 def gdrive_upload_bytes(name: str, data: bytes, mime: str):
+    import tempfile
     drive, folder_id = _drive_client()
-    f = drive.CreateFile({"title": name, "parents": [{"id": folder_id}]})
-    f.Upload({"mimeType": mime, "data": io.BytesIO(data)})
+    f = drive.CreateFile({"title": name, "parents": [{"id": folder_id}], "mimeType": mime})
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        tmp.write(data)
+        tmp.flush()
+        f.SetContentFile(tmp.name)
+    f.Upload()
     return f["id"], f["title"]
 
 def gdrive_list_folder():
@@ -37,9 +44,13 @@ def gdrive_list_folder():
     return drive.ListFile({"q": q}).GetList()
 
 def gdrive_get_file_content(file_id: str) -> bytes:
+    import tempfile
     drive, _ = _drive_client()
     f = drive.CreateFile({"id": file_id})
-    return f.GetContentBinary()
+    with tempfile.NamedTemporaryFile() as tmp:
+        f.GetContentFile(tmp.name)
+        tmp.seek(0)
+        return tmp.read()
 
 # --- Manifest (file JSON nella cartella Drive) ---
 _MANIFEST_NAME = "manifest.json"
@@ -51,29 +62,32 @@ def _find_manifest():
             return it["id"]
     return None
 
+def _save_manifest(man: dict):
+    payload = json.dumps(man, indent=2)
+    drive, folder_id = _drive_client()
+    mf_id = _find_manifest()
+    if mf_id:
+        f = drive.CreateFile({"id": mf_id})
+    else:
+        f = drive.CreateFile({
+            "title": _MANIFEST_NAME,
+            "parents": [{"id": folder_id}],
+            "mimeType": "application/json"
+        })
+    f.SetContentString(payload)
+    f.Upload()
+
 def _load_manifest() -> dict:
     mf_id = _find_manifest()
     if not mf_id:
         return {}
-    raw = gdrive_get_file_content(mf_id)
+    drive, _ = _drive_client()
+    f = drive.CreateFile({"id": mf_id})
+    raw = f.GetContentString()
     try:
-        return json.loads(raw.decode("utf-8"))
+        return json.loads(raw)
     except Exception:
         return {}
-
-def _save_manifest(man: dict):
-    # sovrascrive/crea manifest.json
-    payload = json.dumps(man, indent=2).encode("utf-8")
-    mf_id = _find_manifest()
-    if mf_id:
-        # update
-        drive, _ = _drive_client()
-        f = drive.CreateFile({"id": mf_id})
-        f.SetContentBinary(payload)
-        f.Upload()
-    else:
-        # create
-        gdrive_upload_bytes(_MANIFEST_NAME, payload, "application/json")
 
 def save_uploaded_file_drive(uploaded_file, kind: str) -> dict:
     """
