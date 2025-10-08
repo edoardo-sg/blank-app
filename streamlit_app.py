@@ -15,6 +15,144 @@ def _drive_client():
 
     subject = (st.secrets.get("IMPERSONATE_EMAIL") or os.getenv("IMPERSONATE_EMAIL"))
 
+    # Carica credenziali SA come STRINGA JSON (richiesta da PyDrive2)
+    if "google_sa" in st.secrets:
+        client_json_str = json.dumps(dict(st.secrets["google_sa"]))
+    else:
+        sa_json = st.secrets.get("GDRIVE_SA_JSON") or os.getenv("GDRIVE_SA_JSON")
+        if not sa_json:
+            raise RuntimeError("Credenziali SA non trovate: definisci [google_sa] o GDRIVE_SA_JSON")
+        client_json_str = sa_json if isinstance(sa_json, str) else json.dumps(sa_json)
+
+    settings = {
+        "client_config_backend": "service",
+        "service_config": {
+            "client_json": client_json_str,
+        },
+        "oauth_scope": ["https://www.googleapis.com/auth/drive"]
+    }
+    if subject:
+        settings["service_config"]["client_user_email"] = subject
+
+    gauth = GoogleAuth(settings=settings)
+    gauth.ServiceAuth()
+    drive = GoogleDrive(gauth)
+    return drive, folder_id
+
+def _sha1(b: bytes) -> str:
+    import hashlib
+    return hashlib.sha1(b).hexdigest()[:10]
+
+def gdrive_upload_bytes(name: str, data: bytes, mime: str):
+    # Upload robusto (PyDrive2 non ha SetContentBinary)
+    import tempfile, os
+    drive, folder_id = _drive_client()
+    f = drive.CreateFile({
+        "title": name,
+        "parents": [{"id": folder_id}],
+        "mimeType": mime
+    })
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        tmp.write(data)
+        tmp.flush()
+        tmp_name = tmp.name
+    try:
+        f.SetContentFile(tmp_name)
+        f.Upload()
+    finally:
+        try: os.remove(tmp_name)
+        except: pass
+    return f["id"], f["title"]
+
+def gdrive_list_folder():
+    drive, folder_id = _drive_client()
+    q = f"'{folder_id}' in parents and trashed=false"
+    return drive.ListFile({"q": q}).GetList()
+
+def gdrive_get_file_content(file_id: str) -> bytes:
+    import tempfile
+    drive, _ = _drive_client()
+    f = drive.CreateFile({"id": file_id})
+    with tempfile.NamedTemporaryFile() as tmp:
+        f.GetContentFile(tmp.name)
+        tmp.seek(0)
+        return tmp.read()
+
+# --- Manifest (file JSON nella cartella Drive) ---
+_MANIFEST_NAME = "manifest.json"
+
+def _find_manifest():
+    items = gdrive_list_folder()
+    for it in items:
+        if it["title"] == _MANIFEST_NAME:
+            return it["id"]
+    return None
+
+def _save_manifest(man: dict):
+    payload_str = json.dumps(man, ensure_ascii=False, indent=2)
+    drive, folder_id = _drive_client()
+    mf_id = _find_manifest()
+    f = drive.CreateFile({"id": mf_id}) if mf_id else drive.CreateFile({
+        "title": _MANIFEST_NAME,
+        "parents": [{"id": folder_id}],
+        "mimeType": "application/json",
+    })
+    f.SetContentString(payload_str)
+    f.Upload()
+
+def _load_manifest() -> dict:
+    mf_id = _find_manifest()
+    if not mf_id:
+        return {}
+    raw = gdrive_get_file_content(mf_id)
+    try:
+        return json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+    except Exception:
+        return {}
+
+def save_uploaded_file_drive(uploaded_file_like, kind: str) -> dict:
+    """
+    uploaded_file_like: oggetto con .getvalue() e .name
+    kind: "movements" | "stock"
+    """
+    raw = uploaded_file_like.getvalue()
+    ext = uploaded_file_like.name.split(".")[-1].lower()
+    ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    h = _sha1(raw)
+    title = f"{kind}_{ts}_{h}.{ext}"
+    mime = "text/csv" if ext == "csv" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    file_id, _ = gdrive_upload_bytes(title, raw, mime)
+
+    man = _load_manifest()
+    man[kind] = {
+        "file_id": file_id,
+        "title": title,
+        "uploaded_at_utc": ts,
+        "orig_name": uploaded_file_like.name,
+        "size_bytes": len(raw),
+        "kind": kind,
+        "ext": ext
+    }
+    _save_manifest(man)
+    return man[kind]
+
+def get_last_saved_drive(kind: str) -> dict | None:
+    return _load_manifest().get(kind)
+
+
+
+# --- Google Drive via Service Account (PyDrive2) ---
+def _drive_client():
+    from pydrive2.auth import GoogleAuth
+    from pydrive2.drive import GoogleDrive
+    import json
+
+    folder_id = (st.secrets.get("GDRIVE_FOLDER_ID") or os.getenv("GDRIVE_FOLDER_ID"))
+    if not folder_id:
+        raise RuntimeError("GDRIVE_FOLDER_ID non trovato in st.secrets o env")
+
+    subject = (st.secrets.get("IMPERSONATE_EMAIL") or os.getenv("IMPERSONATE_EMAIL"))
+
     # --- carica credenziali SA ---
     sa_dict = None
     if "google_sa" in st.secrets:
@@ -590,6 +728,35 @@ def process_excel_data(df):
         st.code(traceback.format_exc())
         return pd.DataFrame()
 
+@st.cache_data
+def _parse_movements_from_bytes(data: bytes, name: str) -> pd.DataFrame:
+    bio = io.BytesIO(data); bio.name = name
+    if name.lower().endswith('.csv'):
+        try:
+            df = pd.read_csv(bio, encoding='utf-8-sig', sep=',')
+            if len(df.columns) == 1:
+                bio.seek(0); df = pd.read_csv(bio, encoding='utf-8-sig', sep=';')
+        except:
+            bio.seek(0); df = pd.read_csv(bio, encoding='latin-1', sep=',')
+    else:
+        df = pd.read_excel(bio)
+    return process_excel_data(df)
+
+@st.cache_data
+def _parse_stock_from_bytes(data: bytes, name: str) -> pd.DataFrame:
+    bio = io.BytesIO(data); bio.name = name
+    if name.lower().endswith('.csv'):
+        try:
+            df = pd.read_csv(bio, encoding='utf-8-sig', sep=',')
+            if len(df.columns) == 1:
+                bio.seek(0); df = pd.read_csv(bio, encoding='utf-8-sig', sep=';')
+        except:
+            bio.seek(0); df = pd.read_csv(bio, encoding='latin-1', sep=',')
+    else:
+        df = pd.read_excel(bio)
+    df.columns = [str(c).strip().replace('\ufeff','') for c in df.columns]
+    return process_stock_file(df)
+
 def simple_forecast(ts_data, periods):
     if len(ts_data) < 2:
         avg_value = ts_data.mean() if len(ts_data) > 0 else 1
@@ -1085,9 +1252,21 @@ def get_stock_fields(stock_info, sku):
     current_stock = int(row['current_stock'].iloc[0]) if 'current_stock' in row.columns else 0
     return current_stock, qty_reserved, qty_incoming
 
+def _bytes_key(b: bytes) -> str:
+    import hashlib
+    return hashlib.sha256(b).hexdigest()
+
+@st.cache_data
+def _compute_all(results_key: str, df_mov: pd.DataFrame, stock_info: pd.DataFrame, forecast_days: int, safety_stock_days: int, safety_margin: float):
+    """Wrap di computazioni pesanti per evitare restart al click."""
+    # Qui puoi riportare la tua pipeline di calcolo (global growth, loop prodotti, ecc.)
+    # Ritorna tutto ciò che serve a main() (es. results_df già pronto)
+    return {}
+
 # -------------------------------
 # MAIN
 # -------------------------------
+
 def main():
     translations = load_translations()
 
@@ -1160,6 +1339,89 @@ def main():
                     st.info("📄 Manifest assente o vuoto (verrà creato al primo salvataggio).")
             except Exception as e:
                 st.error(f"Drive KO: {e}")
+
+    # --- Flag bottoni Drive lettura ---
+    want_last_stock = ('use_last_stock' in locals() and use_last_stock)
+    want_last_mov   = ('use_last_mov'   in locals() and use_last_mov)
+
+    # --- Persistenza & acquisizione MOVIMENTI (ordini liberi: upload o drive) ---
+    if uploaded_file is not None:
+        st.session_state['mov_file_bytes'] = uploaded_file.getvalue()
+        st.session_state['mov_file_name']  = uploaded_file.name
+    elif want_last_mov:
+        last = get_last_saved_drive("movements")
+        if last:
+            try:
+                data_bytes = gdrive_get_file_content(last["file_id"])
+                st.session_state['mov_file_bytes'] = data_bytes
+                st.session_state['mov_file_name']  = last["title"]
+                st.success(f"✅ Recuperato movimenti da Drive: {last['title']}")
+            except Exception as e:
+                st.error(f"Errore nel recupero movimenti da Drive: {e}")
+
+    # --- Persistenza & acquisizione STOCK ---
+    if stock_file is not None:
+        st.session_state['stock_file_bytes'] = stock_file.getvalue()
+        st.session_state['stock_file_name']  = stock_file.name
+    elif want_last_stock:
+        last_s = get_last_saved_drive("stock")
+        if last_s:
+            try:
+                s_bytes = gdrive_get_file_content(last_s["file_id"])
+                st.session_state['stock_file_bytes'] = s_bytes
+                st.session_state['stock_file_name']  = last_s["title"]
+                st.success(f"✅ Recuperato stock da Drive: {last_s['title']}")
+            except Exception as e:
+                st.error(f"Errore nel recupero stock da Drive: {e}")
+
+    # --- Gate: procedi SOLO se ho ENTRAMBI i file in sessione ---
+    missing = []
+    if 'mov_file_bytes' not in st.session_state:
+        missing.append("file **Movimenti** (carica o usa l’ultimo da Drive)")
+    if 'stock_file_bytes' not in st.session_state:
+        missing.append("file **Stock** (carica o usa l’ultimo da Drive)")
+
+    if missing:
+        st.markdown("## 👋 Benvenuto")
+        st.warning("Per procedere servono **entrambi** i file:")
+        for m in missing: st.write(f"• {m}")
+        st.stop()
+
+    # --- Ho entrambi: Bytes e nomi “stabili” che non si perdono al rerun ---
+    mov_bytes   = st.session_state['mov_file_bytes']
+    mov_name    = st.session_state['mov_file_name']
+    stock_bytes = st.session_state['stock_file_bytes']
+    stock_name  = st.session_state['stock_file_name']
+
+    # --- Parsing (CACHE) ENTRAMBI ---
+    df = _parse_movements_from_bytes(mov_bytes, mov_name)
+    if df.empty:
+        st.error("❌ Movimenti non validi."); st.stop()
+
+    stock_info = _parse_stock_from_bytes(stock_bytes, stock_name)
+    if stock_info.empty:
+        st.error("❌ Stock non valido."); st.stop()
+
+    # --- Salvataggio su Drive (se richiesto) usando i bytes persistiti ---
+    if 'save_mov' in locals() and save_mov:
+        try:
+            class _MemUp:
+                def __init__(self, data, name): self._d=data; self.name=name
+                def getvalue(self): return self._d
+            rec = save_uploaded_file_drive(_MemUp(mov_bytes, mov_name), "movements")
+            st.success(f"✅ Movimenti salvati su Drive come **{rec['title']}**")
+        except Exception as e:
+            st.error(f"Errore salvataggio movimenti su Drive: {e}")
+
+    if 'save_stock' in locals() and save_stock:
+        try:
+            class _MemUpS:
+                def __init__(self, data, name): self._d=data; self.name=name
+                def getvalue(self): return self._d
+            rec_s = save_uploaded_file_drive(_MemUpS(stock_bytes, stock_name), "stock")
+            st.success(f"✅ Stock salvato su Drive come **{rec_s['title']}**")
+        except Exception as e:
+            st.error(f"Errore salvataggio stock su Drive: {e}")
 
     st.markdown(f"<h1 class='main-header'>{t['title']}</h1>", unsafe_allow_html=True)
     # Link rapido per saltare al riepilogo, prima dell’elaborazione
@@ -1528,12 +1790,35 @@ def main():
         grid_response = AgGrid(
             show_df,
             gridOptions=grid_options,
-            update_mode=GridUpdateMode.MODEL_CHANGED,  # ricevi data aggiornata quando l'utente edita
+            update_mode=GridUpdateMode.MODEL_CHANGED,
             allow_unsafe_jscode=True,
             fit_columns_on_grid_load=False,
-            theme="balham",  # o "streamlit", "alpine"
-            height=800
+            theme="balham",
+            height=800,
+            key="main_grid"  # chiave stabile
         )
+
+        # --- Selezione persistita ---
+        sel = grid_response.get("selected_rows", [])
+        if isinstance(sel, pd.DataFrame):
+            sel = sel.to_dict("records")
+
+        # Se nulla selezionato ma in passato avevamo selezionato, recupera
+        if (not sel) and ('selected_sku' in st.session_state):
+            sku_show = st.session_state['selected_sku']
+            selected_row = show_df[show_df['SKU'] == sku_show].head(1).to_dict("records")
+        else:
+            selected_row = sel
+
+        if not selected_row:
+            st.info("Seleziona un prodotto nella tabella per vedere il dettaglio.")
+            st.stop()
+
+        # Memorizza la selezione corrente
+        sku_show  = (selected_row[0].get("SKU") or selected_row[0].get("sku"))
+        st.session_state['selected_sku'] = sku_show
+        name_show = (selected_row[0].get("Nome Prodotto") or selected_row[0].get("name"))
+
 
         # Leggi eventuali modifiche a MOQ/Lead Time e salvale come prima
         edited_df = pd.DataFrame(grid_response["data"])
