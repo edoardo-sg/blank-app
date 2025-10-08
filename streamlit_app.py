@@ -1650,8 +1650,6 @@ def main():
 
 
         # ------- TABELLA RIEPILOGO (IN ALTO) -------
-        results_df = pd.DataFrame(results)
-
         st.markdown('<a id="riepilogo-prodotti"></a>', unsafe_allow_html=True)
         st.markdown("### 📊 Riepilogo Prodotti")
 
