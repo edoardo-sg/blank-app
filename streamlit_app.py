@@ -3,42 +3,6 @@ import pandas as pd
 import streamlit as st
 from datetime import datetime
 
-# --- Google Drive via Service Account (PyDrive2) ---
-def _drive_client():
-    from pydrive2.auth import GoogleAuth
-    from pydrive2.drive import GoogleDrive
-    import json
-
-    folder_id = (st.secrets.get("GDRIVE_FOLDER_ID") or os.getenv("GDRIVE_FOLDER_ID"))
-    if not folder_id:
-        raise RuntimeError("GDRIVE_FOLDER_ID non trovato in st.secrets o env")
-
-    subject = (st.secrets.get("IMPERSONATE_EMAIL") or os.getenv("IMPERSONATE_EMAIL"))
-
-    # Carica credenziali SA come STRINGA JSON (richiesta da PyDrive2)
-    if "google_sa" in st.secrets:
-        client_json_str = json.dumps(dict(st.secrets["google_sa"]))
-    else:
-        sa_json = st.secrets.get("GDRIVE_SA_JSON") or os.getenv("GDRIVE_SA_JSON")
-        if not sa_json:
-            raise RuntimeError("Credenziali SA non trovate: definisci [google_sa] o GDRIVE_SA_JSON")
-        client_json_str = sa_json if isinstance(sa_json, str) else json.dumps(sa_json)
-
-    settings = {
-        "client_config_backend": "service",
-        "service_config": {
-            "client_json": client_json_str,
-        },
-        "oauth_scope": ["https://www.googleapis.com/auth/drive"]
-    }
-    if subject:
-        settings["service_config"]["client_user_email"] = subject
-
-    gauth = GoogleAuth(settings=settings)
-    gauth.ServiceAuth()
-    drive = GoogleDrive(gauth)
-    return drive, folder_id
-
 def _sha1(b: bytes) -> str:
     import hashlib
     return hashlib.sha1(b).hexdigest()[:10]
@@ -460,9 +424,10 @@ def load_translations():
 # Utils
 # -------------------------------
 def find_column(df, possible_names):
-    for col in df.columns:
-        for possible_name in possible_names:
-            if possible_name.lower() in col.lower():
+    cols_norm = {str(c): str(c).lower().strip().replace('\ufeff','') for c in df.columns}
+    for col, norm in cols_norm.items():
+        for name in possible_names:
+            if name.lower() in norm:
                 return col
     return None
 
@@ -485,8 +450,9 @@ def process_stock_file(df):
         physical_warehouse_col = find_column(df, ['magazzino fisico', 'physical warehouse', 'warehouse physical', 'deposito fisico', 'wms', 'warehouse'])
         if physical_warehouse_col:
             initial_rows = len(df)
-            warehouse_values = ['SMALLGIANTSAVAILABLE', 'SmallGiantsAvailable', 'SMALL GIANTS AVAILABLE']
-            physical_match = df[physical_warehouse_col].astype(str).str.strip().isin(warehouse_values)
+            norm = df[physical_warehouse_col].astype(str).str.upper().str.replace(r'\s+', '', regex=True)
+            warehouse_values = ['SMALLGIANTSAVAILABLE', 'SMALLGIANTSAVAILABLEWMS', 'SMALLGIANTSAVAILABLE-1']
+            physical_match = norm.isin(warehouse_values) | norm.str.contains('SMALLGIANTSAVAILABLE')
             st.write("🔍 Debug filtro magazzino:")
             st.write(f"   • Colonna usata: {physical_warehouse_col}")
             st.write(f"   • Valori unici trovati: {df[physical_warehouse_col].unique()}")
@@ -1475,17 +1441,9 @@ def main():
     stock_bytes = st.session_state['stock_file_bytes']
     stock_name  = st.session_state['stock_file_name']
 
-    df = _parse_movements_from_bytes(mov_bytes, mov_name)
-    if df.empty:
-        st.error("❌ Movimenti non validi."); st.stop()
-
-    stock_info = _parse_stock_from_bytes(stock_bytes, stock_name)
-    if stock_info.empty:
-        st.error("❌ Stock non valido."); st.stop()
-
     # --- Salvataggi su Drive, se richiesti (riusando i bytes in sessione) ---
-    if 'save_mov' in locals() and save_mov:
-        class _MemUp: 
+    if ('save_mov' in locals() and save_mov) and ('mov_file_bytes' in st.session_state):
+        class _MemUp:
             def __init__(self, d, n): self._d=d; self.name=n
             def getvalue(self): return self._d
         try:
@@ -1494,8 +1452,8 @@ def main():
         except Exception as e:
             st.error(f"Errore salvataggio movimenti su Drive: {e}")
 
-    if 'save_stock' in locals() and save_stock:
-        class _MemUpS: 
+    if ('save_stock' in locals() and save_stock) and ('stock_file_bytes' in st.session_state):
+        class _MemUpS:
             def __init__(self, d, n): self._d=d; self.name=n
             def getvalue(self): return self._d
         try:
@@ -1505,124 +1463,58 @@ def main():
             st.error(f"Errore salvataggio stock su Drive: {e}")
 
 
+
     # ------- Processamento completo -------
     with st.spinner(translations['it']['processing']):
 
-        # === MOVIMENTI: usa ultimo da Drive se richiesto ===
-        if uploaded_file is None and ('use_last_mov' in locals() and use_last_mov):
-            last = get_last_saved_drive("movements")
-            if last:
-                try:
-                    st.info(f"⬇️ Scarico ultimo movimenti da Drive: {last['title']}")
-                    data_bytes = gdrive_get_file_content(last["file_id"])
-                    uploaded_file = io.BytesIO(data_bytes)
-                    uploaded_file.name = last["title"]  # per coerenza con UploadedFile
-                except Exception as e:
-                    st.error(f"Errore nel recupero movimenti da Drive: {e}")
-
-        # --- Lettura MOVIMENTI (da upload o da Drive) ---
+        # === MOVIMENTI: leggi sempre dai bytes in sessione ===
         try:
-            if uploaded_file.name.endswith('.csv'):
+            bio = io.BytesIO(mov_bytes)
+            bio.name = mov_name
+            if mov_name.lower().endswith('.csv'):
                 try:
-                    raw_df = pd.read_csv(uploaded_file, encoding='utf-8-sig', sep=',')
+                    raw_df = pd.read_csv(bio, encoding='utf-8-sig', sep=',')
                     if len(raw_df.columns) == 1:
-                        uploaded_file.seek(0)
-                        raw_df = pd.read_csv(uploaded_file, encoding='utf-8-sig', sep=';')
-                except:
-                    uploaded_file.seek(0)
-                    raw_df = pd.read_csv(uploaded_file, encoding='latin-1', sep=',')
+                        bio.seek(0); raw_df = pd.read_csv(bio, encoding='utf-8-sig', sep=';')
+                except Exception:
+                    bio.seek(0); raw_df = pd.read_csv(bio, encoding='latin-1', sep=',')
             else:
-                raw_df = pd.read_excel(uploaded_file)
+                raw_df = pd.read_excel(bio)
 
-            st.write(f"📁 **File caricato (movimenti):** {uploaded_file.name}")
+            st.write(f"📁 **File caricato (movimenti):** {mov_name}")
             st.write(f"📊 **Righe totali:** {len(raw_df)}")
 
             df = process_excel_data(raw_df)
             if df.empty:
-                st.error("❌ Nessun dato valido trovato nel file movimenti.")
-                return
-
-            # Se ho cliccato "salva movimenti" → salvo su Drive
-            if 'save_mov' in locals() and save_mov:
-                try:
-                    # recupero i bytes dall'oggetto corrente
-                    if hasattr(uploaded_file, "getvalue"):
-                        data_bytes = uploaded_file.getvalue()
-                    else:
-                        uploaded_file.seek(0)
-                        data_bytes = uploaded_file.read()
-
-                    # creo un "UploadedFile" fittizio solo per passare a save_uploaded_file_drive
-                    class _MemUp:
-                        def __init__(self, data, name):
-                            self._d = data; self.name = name
-                        def getvalue(self): return self._d
-
-                    mem_up = _MemUp(data_bytes, uploaded_file.name)
-                    rec = save_uploaded_file_drive(mem_up, "movements")
-                    st.success(f"✅ Movimenti salvati su Drive come **{rec['title']}**")
-                except Exception as e:
-                    st.error(f"Errore salvataggio movimenti su Drive: {e}")
-
+                st.error("❌ Nessun dato valido trovato nel file movimenti."); st.stop()
         except Exception as e:
-            st.error(f"Errore durante l'elaborazione del file movimenti: {str(e)}")
-            return
+            st.error(f"Errore durante l'elaborazione del file movimenti: {str(e)}"); st.stop()
 
-        # === STOCK: usa ultimo da Drive se richiesto ===
-        if stock_file is None and ('use_last_stock' in locals() and use_last_stock):
-            last_s = get_last_saved_drive("stock")
-            if last_s:
+
+        # === STOCK: leggi sempre dai bytes in sessione ===
+        try:
+            sbio = io.BytesIO(stock_bytes)
+            sbio.name = stock_name
+            if stock_name.lower().endswith('.csv'):
                 try:
-                    st.info(f"⬇️ Scarico ultimo stock da Drive: {last_s['title']}")
-                    s_bytes = gdrive_get_file_content(last_s["file_id"])
-                    stock_file = io.BytesIO(s_bytes)
-                    stock_file.name = last_s["title"]
-                except Exception as e:
-                    st.error(f"Errore nel recupero stock da Drive: {e}")
+                    stock_raw_df = pd.read_csv(sbio, encoding='utf-8-sig', sep=',')
+                    if len(stock_raw_df.columns) == 1:
+                        sbio.seek(0); stock_raw_df = pd.read_csv(sbio, encoding='utf-8-sig', sep=';')
+                except Exception:
+                    sbio.seek(0); stock_raw_df = pd.read_csv(sbio, encoding='latin-1', sep=',')
+            else:
+                stock_raw_df = pd.read_excel(sbio)
 
-        # --- Lettura STOCK (se presente) ---
-        stock_info = pd.DataFrame()
-        if stock_file is not None:
-            try:
-                if stock_file.name.endswith('.csv'):
-                    try:
-                        stock_raw_df = pd.read_csv(stock_file, encoding='utf-8-sig', sep=',')
-                        if len(stock_raw_df.columns) == 1:
-                            stock_file.seek(0)
-                            stock_raw_df = pd.read_csv(stock_file, encoding='utf-8-sig', sep=';')
-                    except:
-                        stock_file.seek(0)
-                        stock_raw_df = pd.read_csv(stock_file, encoding='latin-1', sep=',')
-                else:
-                    stock_raw_df = pd.read_excel(stock_file)
+            stock_raw_df.columns = [str(c).strip().replace('\ufeff','') for c in stock_raw_df.columns]
+            st.write(f"📋 **Colonne stock trovate:** {list(stock_raw_df.columns)}")
+            st.write(f"📊 **Righe stock:** {len(stock_raw_df)}")
 
-                stock_raw_df.columns = [str(c).strip().replace('\ufeff','') for c in stock_raw_df.columns]
-                st.write(f"📋 **Colonne stock trovate:** {list(stock_raw_df.columns)}")
-                st.write(f"📊 **Righe stock:** {len(stock_raw_df)}")
+            stock_info = process_stock_file(stock_raw_df)
+            if stock_info.empty:
+                st.error("❌ Stock non valido."); st.stop()
+        except Exception as e:
+            st.error(f"Errore nel processare il file stock: {str(e)}"); st.stop()
 
-                stock_info = process_stock_file(stock_raw_df)
-
-                # Se ho cliccato "salva stock" → salvo su Drive
-                if 'save_stock' in locals() and save_stock:
-                    if hasattr(stock_file, "getvalue"):
-                        s_bytes = stock_file.getvalue()
-                    else:
-                        stock_file.seek(0)
-                        s_bytes = stock_file.read()
-
-                    class _MemUpS:
-                        def __init__(self, data, name):
-                            self._d = data; self.name = name
-                        def getvalue(self): return self._d
-
-                    mem_up_s = _MemUpS(s_bytes, stock_file.name)
-                    rec_s = save_uploaded_file_drive(mem_up_s, "stock")
-                    st.success(f"✅ Stock salvato su Drive come **{rec_s['title']}**")
-
-            except Exception as e:
-                st.error(f"Errore nel processare il file stock: {str(e)}")
-                st.info("Procedo senza file stock.")
-                stock_info = pd.DataFrame()
 
 
         # === COMPUTE ALL CACHED, PRIMA DELLA TABELLA ===
@@ -1755,35 +1647,26 @@ def main():
             key="main_grid"
         )
 
-        # --- Selezione persistita ---
         selected_rows = grid_response.get("selected_rows", [])
         if isinstance(selected_rows, pd.DataFrame):
             selected_rows = selected_rows.to_dict("records")
 
-        if selected_rows:
-            sku_show  = selected_rows[0].get("SKU") or selected_rows[0].get("sku")
-            name_show = selected_rows[0].get("Nome Prodotto") or selected_rows[0].get("name")
-            st.session_state['selected_sku']  = sku_show
-            st.session_state['selected_name'] = name_show
-        else:
-            sku_show  = st.session_state.get('selected_sku')
-            name_show = st.session_state.get('selected_name')
+        if not selected_rows:
+            prev = st.session_state.get('selected_sku')
+            if prev:
+                fallback_row = show_df[show_df['SKU'] == prev].head(1).to_dict("records")
+                selected_rows = fallback_row
 
-        if not sku_show:
+        if not selected_rows:
             st.info("Seleziona un prodotto nella tabella per vedere il dettaglio.")
             st.stop()
 
+        selected_row = selected_rows[0]
+        sku_show  = selected_row.get("SKU") or selected_row.get("sku")
+        name_show = selected_row.get("Nome Prodotto") or selected_row.get("name")
+        st.session_state['selected_sku']  = sku_show
+        st.session_state['selected_name'] = name_show
 
-        # Se nulla selezionato ma in passato avevamo selezionato, recupera
-        if (not sel) and ('selected_sku' in st.session_state):
-            sku_show = st.session_state['selected_sku']
-            selected_row = show_df[show_df['SKU'] == sku_show].head(1).to_dict("records")
-        else:
-            selected_row = sel
-
-        if not selected_row:
-            st.info("Seleziona un prodotto nella tabella per vedere il dettaglio.")
-            st.stop()
 
         # Memorizza la selezione corrente
         sku_show  = (selected_row[0].get("SKU") or selected_row[0].get("sku"))
