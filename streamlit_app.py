@@ -7,15 +7,30 @@ from datetime import datetime
 def _drive_client():
     from pydrive2.auth import GoogleAuth
     from pydrive2.drive import GoogleDrive
+    import base64
 
-    # prende il dict direttamente dalla sezione [google_sa] nei secrets
-    sa_info = dict(st.secrets["google_sa"])
-    folder_id = st.secrets["GDRIVE_FOLDER_ID"]
+    # prova: ENV → secrets → None
+    sa_val = os.getenv("GDRIVE_SA_JSON", None)
+    if not sa_val:
+        # st.secrets può restituire stringa OPPURE dict
+        sa_val = st.secrets.get("GDRIVE_SA_JSON", None)
+
+    if isinstance(sa_val, dict):
+        sa_dict = sa_val
+    else:
+        # è una stringa: può essere JSON diretto o base64 del JSON
+        if sa_val.strip().startswith("{"):
+            sa_dict = json.loads(sa_val)
+        else:
+            sa_dict = json.loads(base64.b64decode(sa_val).decode("utf-8"))
+
+    # folder id: ENV prima, poi secrets
+    folder_id = os.getenv("GDRIVE_FOLDER_ID", None) or st.secrets["GDRIVE_FOLDER_ID"]
 
     gauth = GoogleAuth(settings={
         "client_config_backend": "service",
         "service_config": {
-            "client_json": sa_info
+            "client_json": sa_dict
         },
         "oauth_scope": ["https://www.googleapis.com/auth/drive"]
     })
@@ -28,13 +43,9 @@ def _sha1(b: bytes) -> str:
     return hashlib.sha1(b).hexdigest()[:10]
 
 def gdrive_upload_bytes(name: str, data: bytes, mime: str):
-    import tempfile
     drive, folder_id = _drive_client()
     f = drive.CreateFile({"title": name, "parents": [{"id": folder_id}], "mimeType": mime})
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        tmp.write(data)
-        tmp.flush()
-        f.SetContentFile(tmp.name)
+    f.SetContentBinary(data)          # << corretto
     f.Upload()
     return f["id"], f["title"]
 
@@ -63,18 +74,26 @@ def _find_manifest():
     return None
 
 def _save_manifest(man: dict):
-    payload = json.dumps(man, indent=2)
+    import json
+    # JSON → bytes UTF-8 (niente ASCII escaping)
+    payload = json.dumps(man, ensure_ascii=False, indent=2).encode("utf-8")
+
     drive, folder_id = _drive_client()
     mf_id = _find_manifest()
+
     if mf_id:
-        f = drive.CreateFile({"id": mf_id})
+        # aggiorna esistente e assicura mimeType
+        f = drive.CreateFile({"id": mf_id, "mimeType": "application/json"})
     else:
+        # crea nuovo
         f = drive.CreateFile({
             "title": _MANIFEST_NAME,
             "parents": [{"id": folder_id}],
-            "mimeType": "application/json"
+            "mimeType": "application/json",
         })
-    f.SetContentString(payload)
+
+    # salva come binario (più robusto di SetContentString)
+    f.SetContentBinary(payload)
     f.Upload()
 
 def _load_manifest() -> dict:
