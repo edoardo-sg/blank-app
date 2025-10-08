@@ -8,35 +8,39 @@ def _drive_client():
     from pydrive2.auth import GoogleAuth
     from pydrive2.drive import GoogleDrive
 
-    # Leggi secrets o env
-    sa_val = st.secrets.get("GDRIVE_SA_JSON", os.environ.get("GDRIVE_SA_JSON"))
-    folder_id = st.secrets.get("GDRIVE_FOLDER_ID", os.environ.get("GDRIVE_FOLDER_ID"))
-
-    if not sa_val:
-        raise RuntimeError("GDRIVE_SA_JSON non trovato in st.secrets o env")
+    # 1) Folder ID (resta uguale)
+    folder_id = (
+        st.secrets.get("GDRIVE_FOLDER_ID")
+        or os.getenv("GDRIVE_FOLDER_ID")
+    )
     if not folder_id:
         raise RuntimeError("GDRIVE_FOLDER_ID non trovato in st.secrets o env")
 
-    # Normalizza in dict
-    if isinstance(sa_val, dict):
-        sa_dict = sa_val
-    elif isinstance(sa_val, str):
-        s = sa_val.strip()
-        if s.startswith("{"):
-            sa_dict = json.loads(s)
+    # 2) Service account: supporta sia [google_sa] (dict) sia GDRIVE_SA_JSON (stringa JSON)
+    sa_dict = None
+
+    # caso A: sezione TOML [google_sa] (il tuo caso)
+    if "google_sa" in st.secrets:
+        sa_dict = dict(st.secrets["google_sa"])
+
+    # caso B: stringa JSON (opzionale, per retrocompatibilità)
+    if sa_dict is None:
+        sa_json = st.secrets.get("GDRIVE_SA_JSON") or os.getenv("GDRIVE_SA_JSON")
+        if not sa_json:
+            raise RuntimeError("Credenziali SA non trovate: definisci [google_sa] o GDRIVE_SA_JSON")
+        # se è già dict per errore, mantienilo; se è stringa, parse
+        if isinstance(sa_json, str):
+            sa_dict = json.loads(sa_json)
+        elif isinstance(sa_json, dict):
+            sa_dict = sa_json
         else:
-            # opzionale: se hai messo un path a file JSON
-            if os.path.isfile(s):
-                with open(s, "r", encoding="utf-8") as fh:
-                    sa_dict = json.load(fh)
-            else:
-                raise ValueError("GDRIVE_SA_JSON deve essere JSON string o dict, ricevuto stringa non-JSON")
-    else:
-        raise ValueError("GDRIVE_SA_JSON deve essere stringa JSON o dict")
+            raise RuntimeError("GDRIVE_SA_JSON deve essere stringa JSON o dict")
 
     gauth = GoogleAuth(settings={
         "client_config_backend": "service",
-        "service_config": {"client_json": sa_dict},
+        "service_config": {
+            "client_json": sa_dict   # <- usa direttamente il dict
+        },
         "oauth_scope": ["https://www.googleapis.com/auth/drive"]
     })
     gauth.ServiceAuth()
@@ -48,27 +52,16 @@ def _sha1(b: bytes) -> str:
     return hashlib.sha1(b).hexdigest()[:10]
 
 def gdrive_upload_bytes(name: str, data: bytes, mime: str):
-    import tempfile
     drive, folder_id = _drive_client()
     f = drive.CreateFile({
         "title": name,
         "parents": [{"id": folder_id}],
         "mimeType": mime
     })
-    # Scrivi su file temporaneo e carica
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        tmp.write(data)
-        tmp.flush()
-        tmp_path = tmp.name
-    try:
-        f.SetContentFile(tmp_path)
-        f.Upload()
-    finally:
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
+    f.SetContentBinary(data)
+    f.Upload()
     return f["id"], f["title"]
+
 
 def gdrive_list_folder():
     drive, folder_id = _drive_client()
