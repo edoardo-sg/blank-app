@@ -57,7 +57,7 @@ def _drive_client():
         st.info(f"🔐 Autenticato come: {about.get('user', {}).get('emailAddress', 'sconosciuto')}")
     except Exception as e:
         st.warning(f"Impossibile leggere About: {e}")
-        
+
     return drive, folder_id
 
 
@@ -793,82 +793,73 @@ def calculate_monthly_seasonality(all_products_data, single_product_data=None, d
     return final_seasonality
 
 def calculate_growth_rate(ts_data, all_products_data=None, months_to_compare=3):
-    st.write("🔄 Calcolo tasso di crescita:")
-    st.write(f"   • Mesi da confrontare: {months_to_compare}")
-    st.write(f"   • Dati disponibili: da {ts_data.index.min()} a {ts_data.index.max()}")
-    st.write(f"   • Totale uscite nel periodo: {ts_data.sum():.1f}")
+    """
+    Calcola il tasso di crescita come media dei growth YoY degli ultimi `months_to_compare`
+    MESI COMPLETI (esclude sempre il mese corrente e include l'ultimo completo).
+    Se manca il pari mese dell'anno precedente, usa la media dei 6 mesi precedenti a quel mese.
+    """
+    def _prep_monthly(series):
+        s = series.copy()
+        if not isinstance(s.index, pd.DatetimeIndex):
+            s.index = pd.to_datetime(s.index)
+        s = s.sort_index()
+        # escludi SEMPRE il mese corrente
+        start_current_month = pd.Timestamp(year=pd.Timestamp.now().year, month=pd.Timestamp.now().month, day=1)
+        s = s[s.index < start_current_month]
+        # aggrega a mese
+        dfm = s.to_frame(name='sales')
+        dfm['year'] = dfm.index.year
+        dfm['month'] = dfm.index.month
+        monthly = dfm.groupby(['year','month'])['sales'].sum().reset_index()
+        monthly['ym'] = pd.to_datetime(monthly['year'].astype(str) + '-' + monthly['month'].astype(str).str.zfill(2))
+        monthly = monthly.sort_values('ym').reset_index(drop=True)
+        return monthly
 
-    today = datetime.now()
-    last_complete_month = datetime(today.year, today.month, 1) - timedelta(days=1)
-    last_complete_month = last_complete_month.replace(day=1)
-    st.write(f"   • Ultimo mese completo considerato: {last_complete_month.strftime('%Y-%m')}")
-
-    def _calc_growth(data_series):
-        try:
-            if len(data_series) < 30:
-                return 0.0
-            data_series = data_series[data_series.index < last_complete_month]
-            if data_series.empty:
-                return 0.0
-            data_df = data_series.reset_index()
-            data_df.columns = ['date','sales']
-            data_df['month'] = data_df['date'].dt.month
-            data_df['year'] = data_df['date'].dt.year
-            monthly_sales = data_df.groupby(['year','month'])['sales'].sum().reset_index()
-            monthly_sales['ym'] = pd.to_datetime(monthly_sales['year'].astype(str)+'-'+monthly_sales['month'].astype(str).str.zfill(2))
-            monthly_sales = monthly_sales.sort_values('ym')
-
-            if len(monthly_sales) < 2:
-                return 0.0
-            recent_months = monthly_sales.tail(months_to_compare)
-
-            growth_rates = []
-            for _, row in recent_months.iterrows():
-                year = row['year']; month = row['month']
-                current_sales = row['sales']; current_date = row['ym']
-                previous_year = monthly_sales[(monthly_sales['year']==year-1)&(monthly_sales['month']==month)]
-                if not previous_year.empty:
-                    prev_sales = previous_year['sales'].iloc[0]
-                    if prev_sales > 0:
-                        growth = (current_sales - prev_sales) / prev_sales
-                        growth_rates.append(growth)
-                        st.write(f"   📈 {current_date.strftime('%Y-%m')}: {current_sales:.1f} vs {prev_sales:.1f} anno prec. → crescita {growth*100:.1f}%")
-                else:
-                    six_months_ago = current_date - pd.DateOffset(months=7)
-                    prev_6_months = monthly_sales[(monthly_sales['ym'] > six_months_ago) & (monthly_sales['ym'] < current_date - pd.DateOffset(months=1))]
-                    st.write(f"   ℹ️ {current_date.strftime('%Y-%m')}: nessun dato anno precedente, uso media 6 mesi precedenti")
-                    if not prev_6_months.empty:
-                        avg_prev_sales = prev_6_months['sales'].mean()
-                        if avg_prev_sales > 0:
-                            growth = (current_sales - avg_prev_sales) / avg_prev_sales
-                            growth_rates.append(growth)
-
-            if growth_rates:
-                avg_growth = float(np.mean(growth_rates))
-                st.write(f"   📊 Media crescita su {len(growth_rates)} mesi: {avg_growth*100:.1f}%")
-                return avg_growth
-            st.write("   ⚠️ Nessun dato di crescita calcolabile")
-            return 0.0
-        except Exception as e:
-            st.error(f"Errore nel calcolo crescita: {str(e)}")
+    def _growth_from_monthly(monthly_df):
+        if len(monthly_df) == 0:
             return 0.0
 
-    product_growth = _calc_growth(ts_data)
+        # prendi gli ultimi N MESI COMPLETI (già escluso il corrente a monte)
+        recent = monthly_df.tail(months_to_compare)
+        growth_list = []
 
+        for _, row in recent.iterrows():
+            y, m, ym, cur_sales = int(row['year']), int(row['month']), row['ym'], float(row['sales'])
+            # pari mese anno precedente
+            prev = monthly_df[(monthly_df['year'] == y - 1) & (monthly_df['month'] == m)]
+            if not prev.empty:
+                prev_sales = float(prev['sales'].iloc[0])
+                if prev_sales > 0:
+                    growth_list.append((cur_sales - prev_sales) / prev_sales)
+            else:
+                # fallback: media dei 6 mesi precedenti al mese corrente (escluso)
+                window_start = ym - pd.DateOffset(months=6)
+                mask = (monthly_df['ym'] < ym) & (monthly_df['ym'] >= window_start)
+                prev6 = monthly_df[mask]
+                if not prev6.empty:
+                    avg_prev6 = float(prev6['sales'].mean())
+                    if avg_prev6 > 0:
+                        growth_list.append((cur_sales - avg_prev6) / avg_prev6)
+
+        if growth_list:
+            return float(np.mean(growth_list))
+        return 0.0
+
+    # prodotto
+    product_monthly = _prep_monthly(ts_data)
+    product_growth = _growth_from_monthly(product_monthly)
+
+    # globale
     global_growth = 0.0
     if all_products_data is not None:
         if isinstance(all_products_data, pd.DataFrame):
+            # somma vendite di tutti gli SKU per giorno → poi _prep_monthly
             if 'units_sold' in all_products_data.columns:
-                st.write("📈 Calcolo crescita globale:")
-                all_products_series = all_products_data.groupby(all_products_data.index)['units_sold'].sum()
-                global_growth = _calc_growth(all_products_series)
+                daily_sum = all_products_data['units_sold'].groupby(all_products_data.index).sum()
+                global_monthly = _prep_monthly(daily_sum)
+                global_growth = _growth_from_monthly(global_monthly)
 
-    max_growth = max(product_growth, global_growth)
-    st.write("🎯 Riepilogo crescita:")
-    st.write(f"   • Prodotto: {product_growth*100:.1f}%")
-    st.write(f"   • Globale: {global_growth*100:.1f}%")
-    st.write(f"   • Scelto: {max_growth*100:.1f}%")
-    return max_growth
+    return max(product_growth, global_growth)
 
 def forecast_with_monthly_seasonality(data, periods, all_products_data=None, current_sku=None):
     if len(data) < 2:
@@ -1017,7 +1008,7 @@ def _aggregate_series_for_display(daily_hist_series, forecast_df, freq='W'):
 
 def create_forecast_chart(historical_data, forecast_data, product_name, freq='W'):
     """
-    Grafico UI aggregato per settimana/mese.
+    Grafico UI aggregato per settimana/mese con trend line (storico).
     """
     hist, fc = _aggregate_series_for_display(historical_data, forecast_data, freq=freq)
 
@@ -1027,15 +1018,32 @@ def create_forecast_chart(historical_data, forecast_data, product_name, freq='W'
             x=hist.index, y=hist.values,
             mode='lines+markers',
             name=f'Vendite Storiche ({ "Settimana" if freq=="W" else "Mese" })',
-            line=dict(color='#1f77b4', width=2),
+            line=dict(width=2),
             marker=dict(size=6)
         ))
+
+        # --- Trend line (storico) ---
+        try:
+            x = np.arange(len(hist))
+            y = hist.values.astype(float)
+            if len(x) >= 2 and np.isfinite(y).all():
+                a, b = np.polyfit(x, y, 1)  # y = a*x + b
+                trend_y = a * x + b
+                fig.add_trace(go.Scatter(
+                    x=hist.index, y=trend_y,
+                    mode='lines',
+                    name='Trend Storico',
+                    line=dict(width=2, dash='dot')
+                ))
+        except Exception:
+            pass
+
     if forecast_data is not None and not forecast_data.empty:
         fig.add_trace(go.Scatter(
             x=fc.index, y=fc.values,
             mode='lines',
             name=f'Previsione ({ "Settimana" if freq=="W" else "Mese" })',
-            line=dict(color='#ff7f0e', width=2, dash='dash')
+            line=dict(width=2, dash='dash')
         ))
 
     fig.update_layout(
@@ -1047,6 +1055,7 @@ def create_forecast_chart(historical_data, forecast_data, product_name, freq='W'
         showlegend=True
     )
     return fig
+
 
 def load_product_settings():
     try:
@@ -1086,16 +1095,12 @@ def main():
         st.session_state.product_settings = load_product_settings()
 
     with st.sidebar:
-        st.image("https://via.placeholder.com/200x80/1f77b4/white?text=Small+Giants", width=200)
+        st.image("https://eatsmallgiants.com/cdn/shop/files/logo.svg?v=1700560810&width=100", width=100)
         language = st.selectbox("🌐 Language / Lingua", ["it", "en"], index=0)
         t = translations[language]
         st.markdown("---")
-        uploaded_file = st.file_uploader(
-            "📊 " + t['upload_file'] + " (Movimenti)",
-            type=['xlsx', 'xls', 'csv'],
-            help="File con movimenti: Date, Type, Internal SKU, Quantity, ecc.",
-            key="movements_file"
-        )
+
+        # 1) CARICA FILE STOCK
         stock_file = st.file_uploader(
             "📦 Carica File Stock Attuale",
             type=['xlsx', 'xls', 'csv'],
@@ -1103,45 +1108,58 @@ def main():
             key="stock_file"
         )
 
-        # --- Drive actions per MOVIMENTI ---
-        col_m1, col_m2 = st.columns(2)
-        with col_m1:
-            use_last_mov = st.button("⬇️ Usa ultimo movimenti (Drive)", key="use_last_mov")
-        with col_m2:
-            save_mov = st.button("⬆️ Salva movimenti su Drive", key="save_mov")
-
-        # --- Drive actions per STOCK ---
+        # 2) BOTTONI STOCK
         col_s1, col_s2 = st.columns(2)
         with col_s1:
             use_last_stock = st.button("⬇️ Usa ultimo stock (Drive)", key="use_last_stock")
         with col_s2:
             save_stock = st.button("⬆️ Salva stock su Drive", key="save_stock")
 
+        st.markdown("---")
+
+        # 3) CARICA FILE MOVIMENTI
+        uploaded_file = st.file_uploader(
+            "📊 " + t['upload_file'] + " (Movimenti)",
+            type=['xlsx', 'xls', 'csv'],
+            help="File con movimenti: Date, Type, Internal SKU, Quantity, ecc.",
+            key="movements_file"
+        )
+
+        # 4) BOTTONI MOVIMENTI
+        col_m1, col_m2 = st.columns(2)
+        with col_m1:
+            use_last_mov = st.button("⬇️ Usa ultimo movimenti (Drive)", key="use_last_mov")
+        with col_m2:
+            save_mov = st.button("⬆️ Salva movimenti su Drive", key="save_mov")
+
+        st.markdown("---")
+
+        # PARAMETRI
         st.markdown("### ⚙️ Parametri")
         forecast_days = st.slider(t['forecast_days'], 30, 365, 90)
         safety_stock_days = st.slider(t['safety_stock'], 7, 30, 14)
 
         st.markdown("### 📦 Parametri Avanzati")
-        # percentuale 0..1
         safety_margin = st.slider("Margine di Sicurezza (%)", 0, 50, 10) / 100
 
         st.markdown("### 📈 Visualizzazione")
         view_freq = st.radio("Granularità grafici", options=["Mensile","Settimanale"], index=0, horizontal=True)
         freq = 'M' if view_freq == "Mensile" else 'W'
 
-            # --- Diagnostica rapida Drive ---
-    st.markdown("---")
-    if st.button("🧪 Test Drive"):
-        try:
-            drive, folder_id = _drive_client()
-            st.success(f"OK Drive. Folder: {folder_id}")
-            mf = _load_manifest()
-            if mf:
-                st.write("📄 Manifest trovato:", mf)
-            else:
-                st.info("📄 Manifest assente o vuoto (verrà creato al primo salvataggio).")
-        except Exception as e:
-            st.error(f"Drive KO: {e}")
+
+                # --- Diagnostica rapida Drive ---
+        st.markdown("---")
+        if st.button("🧪 Test Drive"):
+            try:
+                drive, folder_id = _drive_client()
+                st.success(f"OK Drive. Folder: {folder_id}")
+                mf = _load_manifest()
+                if mf:
+                    st.write("📄 Manifest trovato:", mf)
+                else:
+                    st.info("📄 Manifest assente o vuoto (verrà creato al primo salvataggio).")
+            except Exception as e:
+                st.error(f"Drive KO: {e}")
 
     st.markdown(f"<h1 class='main-header'>{t['title']}</h1>", unsafe_allow_html=True)
     # Link rapido per saltare al riepilogo, prima dell’elaborazione
@@ -1448,63 +1466,53 @@ def main():
             'lead_time': 'Lead Time'
         })
 
-
         # Costruisci le opzioni Ag-Grid
         gb = GridOptionsBuilder.from_dataframe(show_df)
 
-        # Prima rendi tutte le colonne ridimensionabili
+        # Tutte le colonne ridimensionabili
         gb.configure_default_column(resizable=True)
 
+        # SKU: si adatta (NO suppress), allineamento a sinistra
+        gb.configure_column("SKU", pinned=None, suppressSizeToFit=False)
 
-        # Pinna le prime due e impedisci il fit su di loro (verranno dimensionate via JS)
-        gb.configure_column("SKU", pinned="left", suppressSizeToFit=True)
+        # Nome Prodotto: l’unica NON “fit”. Wrap + altezza auto
         gb.configure_column(
             "Nome Prodotto",
             pinned="left",
-            suppressSizeToFit=True,
-            wrapText=True,          # abilita wrap lato AG Grid
-            autoHeight=True,        # fa crescere la riga se va a capo
+            suppressSizeToFit=True,   # <- unica col non “fit”
+            wrapText=True,
+            autoHeight=True,
             headerTooltip="Nome Prodotto",
-            cellStyle={"white-space": "normal"}  # forza wrap del testo cella
+            cellStyle={"white-space": "normal"}
         )
 
-        # Tutte le altre colonne usano flex (si adattano allo spazio restante)
-        for col in [c for c in show_df.columns if c not in ["SKU", "Nome Prodotto"]]:
-            gb.configure_column(col, flex=1)
+        # Tutte le altre colonne si adattano con flex
+        for col in [c for c in show_df.columns if c not in ["Nome Prodotto"]]:
+            gb.configure_column(col, flex=1, suppressSizeToFit=False)
 
-        # Modifica / editing per MOQ e Lead Time
+        # Editing per MOQ e Lead Time
         gb.configure_column("MOQ", editable=True, type=["numericColumn"])
         gb.configure_column("Lead Time", editable=True, type=["numericColumn"])
 
         # Selezione riga singola con checkbox
         gb.configure_selection(selection_mode="single", use_checkbox=True)
 
-        # Niente paginazione: una sola vista con scroll
+        # No paginazione
         gb.configure_grid_options(pagination=False, domLayout='normal')
 
-        # ---- JS: autosize 1ª colonna, copia larghezza sulla 2ª, fit per le altre ----
+        # JS: fit di tutte le colonne tranne "Nome Prodotto"; poi imposta una minWidth decente al nome
         gb.configure_grid_options(
             onFirstDataRendered=JsCode("""
                 function(params){
-                    // autosize solo la prima colonna
-                    var firstColId = 'SKU';
-                    params.columnApi.autoSizeColumns([firstColId], false);
-
-                    // prendi larghezza effettiva della 1ª
-                    var firstWidth = params.columnApi.getColumn(firstColId).getActualWidth();
-
-                    // imposta la 2ª ('Nome Prodotto') alla stessa larghezza
-                    params.columnApi.setColumnWidths([
-                        { key: 'Nome Prodotto', newWidth: firstWidth }
-                    ]);
-
-                    // ora adatta tutte le altre al contenitore (le prime due sono suppressSizeToFit=True)
+                    // 1) Fit di tutte le colonne (quelle con suppressSizeToFit=True sono escluse)
                     params.api.sizeColumnsToFit();
 
-                    // abilita wrap anche sull'header (se supportato)
+                    // 2) Dai un minimo di larghezza al Nome Prodotto e abilita header wrap
                     try {
                         var col = params.columnApi.getColumn('Nome Prodotto');
                         if (col && col.getColDef()) {
+                            // min larghezza per leggere bene
+                            params.columnApi.setColumnWidths([{ key: 'Nome Prodotto', newWidth: Math.max(col.getActualWidth(), 260) }]);
                             col.getColDef().wrapHeaderText = true;
                             col.getColDef().autoHeaderHeight = true;
                             params.api.refreshHeader();
@@ -1514,8 +1522,8 @@ def main():
             """)
         )
 
-
         grid_options = gb.build()
+
 
         grid_response = AgGrid(
             show_df,
@@ -1663,15 +1671,53 @@ def main():
             hist_b2b, fc_b2b = _aggregate_series_for_display(daily_b2b_show, forecast_b2b_show, freq=freq)
             hist_b2c, fc_b2c = _aggregate_series_for_display(daily_b2c_show, forecast_b2c_show, freq=freq)
             fig_split = go.Figure()
-            fig_split.add_trace(go.Scatter(x=hist_b2b.index, y=hist_b2b.values, mode='lines+markers', name=f'B2B Storico ({ "Settimana" if freq=="W" else "Mese" })'))
-            fig_split.add_trace(go.Scatter(x=fc_b2b.index, y=fc_b2b.values, mode='lines', name=f'B2B Prev ({ "Settimana" if freq=="W" else "Mese" })', line=dict(dash='dash')))
-            fig_split.add_trace(go.Scatter(x=hist_b2c.index, y=hist_b2c.values, mode='lines+markers', name=f'B2C Storico ({ "Settimana" if freq=="W" else "Mese" })'))
-            fig_split.add_trace(go.Scatter(x=fc_b2c.index, y=fc_b2c.values, mode='lines', name=f'B2C Prev ({ "Settimana" if freq=="W" else "Mese" })', line=dict(dash='dash')))
+            # Storici
+            fig_split.add_trace(go.Scatter(x=hist_b2b.index, y=hist_b2b.values, mode='lines+markers',
+                                        name=f'B2B Storico ({ "Settimana" if freq=="W" else "Mese" })',
+                                        line=dict(width=2), marker=dict(size=6)))
+            fig_split.add_trace(go.Scatter(x=hist_b2c.index, y=hist_b2c.values, mode='lines+markers',
+                                        name=f'B2C Storico ({ "Settimana" if freq=="W" else "Mese" })',
+                                        line=dict(width=2), marker=dict(size=6)))
+
+            # Trend B2B
+            try:
+                if len(hist_b2b) >= 2 and np.isfinite(hist_b2b.values.astype(float)).all():
+                    xb = np.arange(len(hist_b2b))
+                    yb = hist_b2b.values.astype(float)
+                    ab, bb = np.polyfit(xb, yb, 1)
+                    trend_b2b = ab * xb + bb
+                    fig_split.add_trace(go.Scatter(x=hist_b2b.index, y=trend_b2b, mode='lines',
+                                                name='Trend B2B', line=dict(width=2, dash='dot')))
+            except Exception:
+                pass
+
+            # Trend B2C
+            try:
+                if len(hist_b2c) >= 2 and np.isfinite(hist_b2c.values.astype(float)).all():
+                    xc = np.arange(len(hist_b2c))
+                    yc = hist_b2c.values.astype(float)
+                    ac, bc = np.polyfit(xc, yc, 1)
+                    trend_b2c = ac * xc + bc
+                    fig_split.add_trace(go.Scatter(x=hist_b2c.index, y=trend_b2c, mode='lines',
+                                                name='Trend B2C', line=dict(width=2, dash='dot')))
+            except Exception:
+                pass
+
+            # Forecast
+            fig_split.add_trace(go.Scatter(x=fc_b2b.index, y=fc_b2b.values, mode='lines',
+                                        name=f'B2B Prev ({ "Settimana" if freq=="W" else "Mese" })',
+                                        line=dict(width=2, dash='dash')))
+            fig_split.add_trace(go.Scatter(x=fc_b2c.index, y=fc_b2c.values, mode='lines',
+                                        name=f'B2C Prev ({ "Settimana" if freq=="W" else "Mese" })',
+                                        line=dict(width=2, dash='dash')))
+
             fig_split.update_layout(
                 title=f'{name_show} – Storico & Previsione per Canale ({ "Settimanale" if freq=="W" else "Mensile" })',
-                xaxis_title='Periodo', yaxis_title='Unità', hovermode='x unified', height=480, showlegend=True
+                xaxis_title='Periodo', yaxis_title='Unità',
+                hovermode='x unified', height=480, showlegend=True
             )
             st.plotly_chart(fig_split, use_container_width=True)
+
 
         colh1, colh2 = st.columns(2)
         with colh1:
