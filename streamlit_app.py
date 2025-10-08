@@ -7,8 +7,9 @@ from datetime import datetime
 def _drive_client():
     from pydrive2.auth import GoogleAuth
     from pydrive2.drive import GoogleDrive
+    import json
 
-    # Folder ID
+    # 1) Folder ID
     folder_id = (
         st.secrets.get("GDRIVE_FOLDER_ID")
         or os.getenv("GDRIVE_FOLDER_ID")
@@ -16,40 +17,35 @@ def _drive_client():
     if not folder_id:
         raise RuntimeError("GDRIVE_FOLDER_ID non trovato in st.secrets o env")
 
-    # Service Account: [google_sa] (dict) o GDRIVE_SA_JSON (stringa JSON o dict)
-    sa_dict = None
+    # 2) Credenziali SA: accetta [google_sa] (TOML) o GDRIVE_SA_JSON (stringa)
+    sa_json_str = None
 
+    # Caso A: sezione TOML [google_sa] -> convertila in stringa JSON
     if "google_sa" in st.secrets:
-        # Streamlit secrets TOML → dict
         sa_dict = dict(st.secrets["google_sa"])
+        sa_json_str = json.dumps(sa_dict)   # <-- PyDrive2 vuole STRINGA, non dict
 
-    if sa_dict is None:
-        sa_val = st.secrets.get("GDRIVE_SA_JSON") or os.getenv("GDRIVE_SA_JSON")
-        if not sa_val:
+    # Caso B: variabile/stringa GDRIVE_SA_JSON
+    if sa_json_str is None:
+        sa_raw = st.secrets.get("GDRIVE_SA_JSON") or os.getenv("GDRIVE_SA_JSON")
+        if not sa_raw:
             raise RuntimeError("Credenziali SA non trovate: definisci [google_sa] o GDRIVE_SA_JSON")
-        if isinstance(sa_val, str):
-            sa_dict = json.loads(sa_val)  # era stringa JSON
-        elif isinstance(sa_val, dict):
-            sa_dict = sa_val             # era già dict
+        # Se è già stringa, usala; se è dict (raro), serializzalo
+        if isinstance(sa_raw, dict):
+            sa_json_str = json.dumps(sa_raw)
         else:
-            raise RuntimeError("GDRIVE_SA_JSON deve essere stringa JSON o dict")
-
-    # Normalizza la private_key se qualcuno l'ha salvata con backslash-n
-    pk = sa_dict.get("private_key", "")
-    if isinstance(pk, str) and "\\n" in pk and "\n" not in pk:
-        sa_dict["private_key"] = pk.replace("\\n", "\n")
+            sa_json_str = str(sa_raw)
 
     gauth = GoogleAuth(settings={
         "client_config_backend": "service",
         "service_config": {
-            "client_json": sa_dict
+            "client_json": sa_json_str  # <-- STRINGA JSON
         },
         "oauth_scope": ["https://www.googleapis.com/auth/drive"]
     })
     gauth.ServiceAuth()
     drive = GoogleDrive(gauth)
     return drive, folder_id
-
 
 
 def _sha1(b: bytes) -> str:
@@ -1111,7 +1107,7 @@ def main():
         st.markdown("### 📈 Visualizzazione")
         view_freq = st.radio("Granularità grafici", options=["Mensile","Settimanale"], index=0, horizontal=True)
         freq = 'M' if view_freq == "Mensile" else 'W'
-        
+
             # --- Diagnostica rapida Drive ---
     st.markdown("---")
     if st.button("🧪 Test Drive"):
