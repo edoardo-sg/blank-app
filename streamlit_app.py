@@ -7,8 +7,8 @@ from datetime import datetime
 def _drive_client():
     from pydrive2.auth import GoogleAuth
     from pydrive2.drive import GoogleDrive
-    import json, os, streamlit as st
 
+    # Folder ID
     folder_id = (
         st.secrets.get("GDRIVE_FOLDER_ID")
         or os.getenv("GDRIVE_FOLDER_ID")
@@ -16,37 +16,40 @@ def _drive_client():
     if not folder_id:
         raise RuntimeError("GDRIVE_FOLDER_ID non trovato in st.secrets o env")
 
-    # --- credenziali SA: sezione TOML [google_sa] oppure stringa JSON ---
+    # Email da impersonare (se usi Domain-wide Delegation)
+    subject = (
+        st.secrets.get("IMPERSONATE_EMAIL")
+        or os.getenv("IMPERSONATE_EMAIL")
+    )
+
+    # Service Account: preferisci la sezione TOML [google_sa] (già dict)
+    sa_dict = None
     if "google_sa" in st.secrets:
         sa_dict = dict(st.secrets["google_sa"])
     else:
+        # fallback: variabile GDRIVE_SA_JSON può essere stringa JSON o già dict
         sa_json = st.secrets.get("GDRIVE_SA_JSON") or os.getenv("GDRIVE_SA_JSON")
         if not sa_json:
             raise RuntimeError("Credenziali SA non trovate: definisci [google_sa] o GDRIVE_SA_JSON")
-        sa_dict = json.loads(sa_json) if isinstance(sa_json, str) else sa_json
+        if isinstance(sa_json, str):
+            sa_dict = json.loads(sa_json)  # qui è stringa -> parse
+        elif isinstance(sa_json, dict):
+            sa_dict = sa_json              # è già dict -> usa così com'è
+        else:
+            raise RuntimeError("GDRIVE_SA_JSON deve essere stringa JSON o dict")
 
-    # --- ⚠️ importantissimo: email dell'utente da IMPERSONARE (subject) ---
-    # Mettila in st.secrets["IMPERSONATE_USER"] o env IMPERSONATE_USER
-    user_to_impersonate = (
-        st.secrets.get("IMPERSONATE_USER")
-        or os.getenv("IMPERSONATE_USER")
-    )
-    if not user_to_impersonate:
-        raise RuntimeError("IMPERSONATE_USER mancante (utente Workspace da impersonare)")
-
-    gauth = GoogleAuth(settings={
+    settings = {
         "client_config_backend": "service",
         "service_config": {
-            # credenziali SA
             "client_json": sa_dict,
-            # <-- QUI la delega a livello di dominio: utente impersonato
-            "client_user_email": user_to_impersonate,
         },
-        "oauth_scope": [
-            "https://www.googleapis.com/auth/drive",
-            "https://www.googleapis.com/auth/drive.file",
-        ],
-    })
+        "oauth_scope": ["https://www.googleapis.com/auth/drive"]
+    }
+    # Impersonation (se impostato)
+    if subject:
+        settings["service_config"]["client_user_email"] = subject
+
+    gauth = GoogleAuth(settings=settings)
     gauth.ServiceAuth()
     drive = GoogleDrive(gauth)
     return drive, folder_id
@@ -56,27 +59,27 @@ def _sha1(b: bytes) -> str:
     return hashlib.sha1(b).hexdigest()[:10]
 
 def gdrive_upload_bytes(name: str, data: bytes, mime: str):
-    from pydrive2.auth import GoogleAuth
-    from pydrive2.drive import GoogleDrive
     import tempfile
-
     drive, folder_id = _drive_client()
     f = drive.CreateFile({
         "title": name,
         "parents": [{"id": folder_id}],
         "mimeType": mime
     })
-
-    # Scrivi i bytes su un file temporaneo e caricalo
+    # PyDrive2 NON ha SetContentBinary: usa un file temporaneo
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         tmp.write(data)
         tmp.flush()
-        f.SetContentFile(tmp.name)
-
-    f.Upload()
+        tmp_name = tmp.name
+    try:
+        f.SetContentFile(tmp_name)
+        f.Upload()
+    finally:
+        try:
+            os.remove(tmp_name)
+        except Exception:
+            pass
     return f["id"], f["title"]
-
-
 
 def gdrive_list_folder():
     drive, folder_id = _drive_client()
@@ -88,7 +91,7 @@ def gdrive_get_file_content(file_id: str) -> bytes:
     drive, _ = _drive_client()
     f = drive.CreateFile({"id": file_id})
     with tempfile.NamedTemporaryFile() as tmp:
-        f.GetContentFile(tmp.name)
+        f.GetContentFile(tmp.name)  # scarica su file
         tmp.seek(0)
         return tmp.read()
 
@@ -103,23 +106,23 @@ def _find_manifest():
     return None
 
 def _save_manifest(man: dict):
-    # serializza in UTF-8 senza escape ASCII e carica come stringa
+    # salva manifest.json come TESTO (SetContentString)
     payload_str = json.dumps(man, ensure_ascii=False, indent=2)
 
     drive, folder_id = _drive_client()
     mf_id = _find_manifest()
 
     if mf_id:
-        f = drive.CreateFile({"id": mf_id, "mimeType": "application/json"})
+        f = drive.CreateFile({"id": mf_id})
     else:
         f = drive.CreateFile({
             "title": _MANIFEST_NAME,
             "parents": [{"id": folder_id}],
             "mimeType": "application/json",
         })
-
     f.SetContentString(payload_str)
     f.Upload()
+
 
 
 def _load_manifest() -> dict:
