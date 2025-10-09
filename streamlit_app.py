@@ -290,7 +290,7 @@ import calendar
 import warnings
 from datetime import datetime, timedelta
 
-from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode, DataReturnMode
 
 import streamlit as st
 import pandas as pd
@@ -1223,7 +1223,7 @@ def _bytes_key(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 @st.cache_data
-def _compute_all(results_key: str, df_mov: pd.DataFrame, stock_info: pd.DataFrame, forecast_days: int, safety_stock_days: int, safety_margin: float):
+def _compute_all(results_key: str, df_mov: pd.DataFrame, stock_info: pd.DataFrame, forecast_days: int, safety_stock_days: int, safety_margin: float, product_settings: pd.DataFrame):
     # Qui metti il calcolo di:
     # - products_df
     # - results_df (tabella riepilogo)
@@ -1252,7 +1252,6 @@ def _compute_all(results_key: str, df_mov: pd.DataFrame, stock_info: pd.DataFram
     # costruisci results_df come nel tuo loop attuale (puoi riusare il codice invariato),
     # ma SENZA st.write e st.*; restituisci il DataFrame finale.
     results = []
-    product_settings = load_product_settings()
 
     for _, prow in products_df.iterrows():
         sku = prow['sku']; product_name = prow['name']
@@ -1519,21 +1518,31 @@ def main():
 
         # === COMPUTE ALL CACHED, PRIMA DELLA TABELLA ===
         # Key stabile: dipende dai bytes dei file + parametri UI
+        # Fingerprint delle impostazioni per invalidare la cache quando cambi MOQ/lead_time
+        if 'product_settings' in st.session_state and not st.session_state.product_settings.empty:
+            _ps = st.session_state.product_settings.sort_values("sku").astype(str)
+            settings_fp = hashlib.sha256(_ps.to_csv(index=False).encode("utf-8")).hexdigest()[:10]
+        else:
+            settings_fp = "no-settings"
+
         results_key = "|".join([
             _bytes_key(mov_bytes),
             _bytes_key(stock_bytes),
             str(forecast_days),
             str(safety_stock_days),
-            str(safety_margin)
+            str(safety_margin),
+            settings_fp
         ])
+
 
         bundle = _compute_all(
             results_key,
-            df,            # df movimenti già processato: colonne date/sku/units_sold…
-            stock_info,    # df stock già processato: colonne sku/current_stock/qty_*
+            df,
+            stock_info,
             forecast_days,
             safety_stock_days,
-            safety_margin
+            safety_margin,
+            st.session_state.product_settings.copy() if 'product_settings' in st.session_state else pd.DataFrame(columns=['sku','moq','lead_time'])
         )
 
         products_df   = bundle['products_df']
@@ -1624,6 +1633,7 @@ def main():
         # Editing per MOQ e Lead Time
         gb.configure_column("MOQ", editable=True, type=["numericColumn"])
         gb.configure_column("Lead Time", editable=True, type=["numericColumn"])
+        gb.configure_grid_options(stopEditingWhenCellsLoseFocus=True)
 
         # Selezione riga singola con checkbox
         gb.configure_selection(selection_mode="single", use_checkbox=True)
@@ -1659,13 +1669,37 @@ def main():
         grid_response = AgGrid(
             show_df,
             gridOptions=grid_options,
-            update_mode=GridUpdateMode.SELECTION_CHANGED,  # ← prima era MODEL_CHANGED
+            data_return_mode=DataReturnMode.AS_INPUT,     # ← restituisce i valori correnti, anche se non c’è rerun
+            update_mode=GridUpdateMode.VALUE_CHANGED | GridUpdateMode.SELECTION_CHANGED,
             allow_unsafe_jscode=True,
             fit_columns_on_grid_load=False,
             theme="balham",
             height=800,
-            key="main_grid"
+            key="main_grid",
+            enable_enterprise_modules=False
         )
+
+                # --- Persistenza MOQ / Lead Time da griglia ---
+        edited_df = pd.DataFrame(grid_response.get("data", show_df)).copy()
+        # Normalizza colonne attese
+        if not edited_df.empty:
+            for col in ["SKU", "MOQ", "Lead Time"]:
+                if col not in edited_df.columns:
+                    st.error(f"Manca la colonna {col} nella griglia, impossibile salvare impostazioni.")
+                    st.stop()
+            # Prepara il dataframe impostazioni
+            settings_df = edited_df[["SKU", "MOQ", "Lead Time"]].rename(columns={"SKU":"sku","Lead Time":"lead_time","MOQ":"moq"})
+            # Coerce numerici
+            settings_df["sku"] = settings_df["sku"].astype(str).str.strip()
+            settings_df["moq"] = pd.to_numeric(settings_df["moq"], errors="coerce").fillna(1).astype(int)
+            settings_df["lead_time"] = pd.to_numeric(settings_df["lead_time"], errors="coerce").fillna(7).astype(int)
+
+            # Salva in sessione per uso immediato nel dettaglio
+            st.session_state.product_settings = settings_df.copy()
+
+            # Scrivi su disco
+            save_product_settings(settings_df)
+
 
         selected_rows = grid_response.get("selected_rows", [])
         if isinstance(selected_rows, pd.DataFrame):
