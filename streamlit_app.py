@@ -1569,7 +1569,6 @@ def main():
         # Etichetta dinamica per la previsione totale (basata sullo slider)
         prev_col_label = f"Prev Tot ({forecast_days} gg)"
 
-        # Seleziona SOLO le colonne richieste
         show_df = results_df[[
             'sku',
             'name',
@@ -1585,7 +1584,7 @@ def main():
             'sku': 'SKU',
             'name': 'Nome Prodotto',
             'current_stock': 'Stock Attuale',
-            'forecast_tot': prev_col_label,           # <-- colonna “Prev Tot”
+            # 'forecast_tot' resta uguale come field
             'monthly_avg': 'Media Mensile',
             'last_month_avg': 'Media Ultimo Mese',
             'status': 'Stato',
@@ -1593,6 +1592,7 @@ def main():
             'moq': 'MOQ',
             'lead_time': 'Lead Time'
         })
+
 
         # Applica filtro solo su Nome Prodotto
         if search_name:
@@ -1607,6 +1607,14 @@ def main():
 
         # Costruisci le opzioni Ag-Grid
         gb = GridOptionsBuilder.from_dataframe(show_df)
+
+        # Header dinamico sulla colonna forecast tenendo il field fisso
+        gb.configure_column(
+            "forecast_tot",
+            headerName=prev_col_label,
+            type=["numericColumn"]
+        )
+
         # Default: niente filtri sulle colonne
         gb.configure_default_column(resizable=True, filter=False, floatingFilter=False)
 
