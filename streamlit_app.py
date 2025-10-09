@@ -1608,6 +1608,9 @@ def main():
         # Costruisci le opzioni Ag-Grid
         gb = GridOptionsBuilder.from_dataframe(show_df)
 
+        # Etichetta UI desiderata
+        prev_col_label = f"Prev Tot ({forecast_days} gg)"
+
         # Header dinamico sulla colonna forecast tenendo il field fisso
         gb.configure_column(
             "forecast_tot",
