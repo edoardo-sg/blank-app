@@ -73,6 +73,13 @@ def _load_manifest() -> dict:
         return json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
     except Exception:
         return {}
+def set_b2c_baseline_record(rec: dict):
+    man = _load_manifest()
+    man["b2c_baseline"] = rec
+    _save_manifest(man)
+
+def get_b2c_baseline_record() -> dict | None:
+    return _load_manifest().get("b2c_baseline")
 
 def save_uploaded_file_drive(uploaded_file_like, kind: str) -> dict:
     """
@@ -693,6 +700,71 @@ def process_excel_data(df):
         import traceback
         st.code(traceback.format_exc())
         return pd.DataFrame()
+
+def _load_b2c_baseline_from_drive() -> pd.DataFrame:
+    rec = get_b2c_baseline_record()
+    if not rec:
+        return pd.DataFrame()
+    try:
+        raw = gdrive_get_file_content(rec["file_id"])
+        bio = io.BytesIO(raw); bio.name = rec["title"]
+        # lettura robusta
+        try:
+            df = pd.read_csv(bio, encoding="utf-8-sig")
+            if df.shape[1] == 1:
+                bio.seek(0); df = pd.read_csv(bio, encoding="utf-8-sig", sep=";")
+        except Exception:
+            bio.seek(0); df = pd.read_csv(bio, encoding="latin-1")
+    except Exception:
+        return pd.DataFrame()
+
+    cols = {str(c).strip(): c for c in df.columns}
+    def pick(*names):
+        for n in names:
+            if n in cols: return cols[n]
+        # fallback case-insensitive
+        lower = {k.lower(): k for k in cols}
+        for n in names:
+            if n.lower() in lower: return lower[n.lower()]
+        return None
+
+    c_date_paid = pick("Paid at")
+    c_date_crea = pick("Created at")
+    c_ord       = pick("Name")
+    c_sku       = pick("Lineitem sku")
+    c_qty       = pick("Lineitem quantity")
+    c_pname     = pick("Lineitem name")
+    c_fin       = pick("Financial Status")
+
+    # campi minimi
+    if not (c_sku and c_qty and (c_date_paid or c_date_crea)):
+        return pd.DataFrame()
+
+    # scegli data: Paid at > Created at
+    date_raw = df[c_date_paid] if c_date_paid else df[c_date_crea]
+    date_parsed = pd.to_datetime(date_raw, errors="coerce").dt.tz_localize(None).dt.date
+    out = pd.DataFrame()
+    out["date"] = pd.to_datetime(date_parsed)
+    out["sku"]  = df[c_sku].astype(str).str.strip()
+    out["product_name"] = (df[c_pname] if c_pname else "").astype(str)
+    out["units_sold"]     = pd.to_numeric(df[c_qty], errors="coerce").fillna(0).astype(int)
+    out["units_sold_b2c"] = out["units_sold"]
+    out["units_sold_b2b"] = 0
+    if c_ord:
+        out["order_id"] = df[c_ord].astype(str)
+
+    # filtra pagati se disponibile
+    if c_fin:
+        ok = df[c_fin].astype(str).str.lower().isin(["paid","partially_paid","authorized"])
+        out = out[ok].copy()
+
+    out = out.dropna(subset=["date","sku"])
+    out = out[out["units_sold"] > 0]
+
+    # aggrega a granularità (date, sku, product_name)
+    out = (out.groupby(["date","sku","product_name"], as_index=False)
+              .agg({"units_sold":"sum","units_sold_b2c":"sum","units_sold_b2b":"sum"}))
+    return out
 
 @st.cache_data
 def _parse_movements_from_bytes(data: bytes, name: str) -> pd.DataFrame:
@@ -1389,6 +1461,53 @@ def main():
             except Exception as e:
                 st.error(f"Drive KO: {e}")
 
+        with st.sidebar.expander("🛠️ Admin – Baseline B2C Shopify", expanded=False):
+            st.markdown("Carica il CSV *Orders with line items* (Shopify).")
+            baseline_file = st.file_uploader("CSV baseline B2C Shopify", type=["csv"], key="baseline_b2c_csv")
+
+            overwrite = st.checkbox("Sovrascrivi se esiste già", value=False, help="Aggiorna il manifest e sostituisci il file su Drive")
+            do_register = st.button("📌 Imposta/aggiorna baseline B2C")
+
+            if do_register:
+                try:
+                    if baseline_file is None:
+                        st.error("Carica un file CSV prima.")
+                    else:
+                        # 1) Leggi bytes e calcola hash
+                        csv_bytes = baseline_file.getvalue()
+                        sha = _sha1(csv_bytes)
+
+                        # 2) Carica su Drive con nome speciale
+                        fname = "b2c_baseline_shopify.csv"
+                        file_id, title = gdrive_upload_bytes(fname, csv_bytes, "text/csv")
+
+                        # 3) Se già esiste e non vuoi sovrascrivere → blocca
+                        existing = get_b2c_baseline_record()
+                        if existing and existing.get("locked") and not overwrite:
+                            st.warning("Esiste già una baseline con locked=true. Abilita 'Sovrascrivi' per sostituire.")
+                        else:
+                            # 4) Scrivi nel manifest
+                            rec = {
+                                "file_id": file_id,
+                                "title": title,
+                                "orig_name": baseline_file.name,
+                                "uploaded_at_utc": datetime.utcnow().strftime("%Y%m%d-%H%M%S"),
+                                "sha1": sha,
+                                "locked": True
+                            }
+                            set_b2c_baseline_record(rec)
+                            st.success(f"Baseline registrata: {title} (sha1={sha})")
+
+                            # 5) Sanity check lettura immediata
+                            test_df = _load_b2c_baseline_from_drive()
+                            if test_df.empty:
+                                st.warning("Baseline caricata ma parsing vuoto: verifica le colonne dell'export.")
+                            else:
+                                st.info(f"Baseline OK. Righe utili: {len(test_df)} | Periodo: {test_df['date'].min().date()} → {test_df['date'].max().date()}")
+                except Exception as e:
+                    st.error(f"Errore durante la registrazione baseline: {e}")
+
+
     # --- Flag bottoni Drive lettura ---
     want_last_stock = ('use_last_stock' in locals() and use_last_stock)
     want_last_mov   = ('use_last_mov'   in locals() and use_last_mov)
@@ -1488,6 +1607,25 @@ def main():
                 st.error("❌ Nessun dato valido trovato nel file movimenti."); st.stop()
         except Exception as e:
             st.error(f"Errore durante l'elaborazione del file movimenti: {str(e)}"); st.stop()
+
+            # >>> Shopify B2C baseline (se presente nel manifest)
+            b2c_base = _load_b2c_baseline_from_drive()
+            if not b2c_base.empty:
+                # uniforma eventuali colonne mancanti
+                for c in ["date","sku","product_name","units_sold","units_sold_b2b","units_sold_b2c"]:
+                    if c not in df.columns:
+                        df[c] = 0 if c.startswith("units_") else df.get(c, "")
+
+                merged = pd.concat(
+                    [df[["date","sku","product_name","units_sold","units_sold_b2b","units_sold_b2c"]],
+                    b2c_base[["date","sku","product_name","units_sold","units_sold_b2b","units_sold_b2c"]]],
+                    ignore_index=True
+                )
+                df = (merged.groupby(["date","sku","product_name"], as_index=False)
+                        .agg({"units_sold":"sum",
+                                "units_sold_b2b":"sum",
+                                "units_sold_b2c":"sum"}))
+                st.info(f"🧩 Storico B2C extra unito: {len(b2c_base)} righe baseline aggiunte")
 
 
         # === STOCK: leggi sempre dai bytes in sessione ===
