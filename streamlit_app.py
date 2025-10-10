@@ -1089,66 +1089,112 @@ def calculate_growth_rate(ts_data, all_products_data=None, months_to_compare=3):
     return max(product_growth, global_growth)
 
 def forecast_with_monthly_seasonality(data, periods, all_products_data=None, current_sku=None):
+    # data deve essere una Series indicizzata per data
+    if not isinstance(data.index, pd.DatetimeIndex):
+        data = pd.Series(data.values, index=pd.to_datetime(data.index, errors="coerce"))
+    data = data.sort_index()
+    data = data[~data.index.isna()]
+
     if len(data) < 2:
         return simple_forecast(data, periods)
+
     try:
         data_df = data.reset_index()
         data_df.columns = ['date','sales']
         data_df['month'] = data_df['date'].dt.month
-        data_df['year'] = data_df['date'].dt.year
+        data_df['year']  = data_df['date'].dt.year
         last_date = data_df['date'].max()
 
+        # mensile storico del singolo SKU (serve per pari mese a.a.)
         monthly_sales = data_df.groupby(['year','month'])['sales'].sum().reset_index()
-        growth_rate = calculate_growth_rate(data, months_to_compare=3)
+
+        # growth (prodotto vs globale) – clamp naturale nelle funzioni già presenti
+        growth_rate = calculate_growth_rate(data, all_products_data=all_products_data, months_to_compare=3)
+        # guard-rail: limita outlier YoY (−50% … +80%)
+        growth_rate = float(np.clip(growth_rate, -0.5, 0.8))
         st.info(f"📈 Tasso di crescita rilevato: {growth_rate*100:.1f}%")
 
+        # pesi OOS più “stringenti”
         daily_series_for_weights = data.copy().sort_index().resample('D').sum().fillna(0)
-        month_weights = compute_oos_month_weights(daily_series_for_weights, min_run_days=14, min_weight=0.2)
+        month_weights = compute_oos_month_weights(daily_series_for_weights, min_run_days=14, min_weight=0.1)
 
+        # stagionalità globale/prodotto
         if all_products_data is None:
             all_products_data = data.to_frame(name='units_sold')
-        seasonal_factors = calculate_monthly_seasonality(all_products_data,
-                                                         daily_series_for_weights=daily_series_for_weights,
-                                                         min_run_days=14, min_weight=0.2)
+        seasonal_factors = calculate_monthly_seasonality(
+            all_products_data,
+            daily_series_for_weights=daily_series_for_weights,
+            min_run_days=14,
+            min_weight=0.1
+        )
 
-        recent_avg = float(data.tail(30).mean()) if len(data) >= 30 else float(data.mean()) if len(data) > 0 else 0.0
+        # baseline recente
+        recent_avg = float(data.tail(30).mean()) if len(data) >= 30 else (float(data.mean()) if len(data) > 0 else 0.0)
 
-        forecast_data = []
+        forecast_rows = []
         for i in range(1, periods + 1):
-            forecast_date = last_date + timedelta(days=i)
-            forecast_month = forecast_date.month
-            forecast_year = forecast_date.year
-            same_month_last_year = monthly_sales[(monthly_sales['year']==forecast_year-1)&(monthly_sales['month']==forecast_month)]
+            forecast_date  = last_date + timedelta(days=i)
+            forecast_month = int(forecast_date.month)
+            forecast_year  = int(forecast_date.year)
+
+            # stagionalità clampata per evitare fattori “turbo”
+            sf = float(np.clip(seasonal_factors.get(forecast_month, 1.0), 0.7, 1.3))
+
+            same_month_last_year = monthly_sales[
+                (monthly_sales['year'] == forecast_year - 1) &
+                (monthly_sales['month'] == forecast_month)
+            ]
             period_prev_year = pd.Period(year=forecast_year-1, month=forecast_month, freq='M')
 
             if not same_month_last_year.empty:
-                base_monthly_sales = float(same_month_last_year['sales'].iloc[0])
-                adjusted_monthly_sales = base_monthly_sales * (1 + growth_rate)
-                days_in_month = calendar.monthrange(forecast_year, forecast_month)[1]
-                month_weight = month_weights.get(period_prev_year, 1.0)
-                if month_weight == 0.0:
-                    seasonal_factor = seasonal_factors.get(forecast_month, 1.0)
-                    base_value = recent_avg * seasonal_factor * (1 + growth_rate * 0.5)
-                elif month_weight < 1.0:
+                base_monthly_sales    = float(same_month_last_year['sales'].iloc[0])
+                adjusted_monthly_sales = base_monthly_sales * (1 + 0.6 * growth_rate)  # damping
+                days_in_month         = calendar.monthrange(forecast_year, forecast_month)[1]
+                w = float(month_weights.get(period_prev_year, 1.0))
+
+                if w == 0.0:
+                    base_value = recent_avg * sf * (1 + 0.5 * growth_rate)
+                elif w < 1.0:
                     val_from_lastyear = adjusted_monthly_sales / days_in_month
-                    val_from_recent = recent_avg * seasonal_factors.get(forecast_month, 1.0) * (1 + growth_rate * 0.5)
-                    base_value = month_weight * val_from_lastyear + (1.0 - month_weight) * val_from_recent
+                    val_from_recent   = recent_avg * sf * (1 + 0.5 * growth_rate)
+                    base_value = w * val_from_lastyear + (1.0 - w) * val_from_recent
                 else:
                     base_value = adjusted_monthly_sales / days_in_month
             else:
-                seasonal_factor = seasonal_factors.get(forecast_month, 1.0)
-                base_value = recent_avg * seasonal_factor * (1 + growth_rate * 0.5)
+                base_value = recent_avg * sf * (1 + 0.5 * growth_rate)
 
-            forecast_value = max(0, base_value)
-            std_dev = data.std() if len(data) > 1 else forecast_value * 0.3
-            forecast_data.append({
-                'ds': forecast_date,
-                'yhat': forecast_value,
-                'yhat_lower': max(0, forecast_value - 1.5 * std_dev),
+            # ---------- CAP STAGIONALE + SOFT-CAP ----------
+            # storico dello stesso mese (tutti gli anni) — se manca, fallback all’intera serie
+            hist_same_month = data[data.index.month == forecast_month].dropna()
+            vals = np.asarray(hist_same_month.values if len(hist_same_month) > 0 else data.dropna().values)
+
+            if vals.size > 0:
+                p95 = float(np.nanpercentile(vals, 95)) if vals.size > 20 else 1.6 * recent_avg
+            else:
+                p95 = 1.6 * recent_avg
+
+            # cap scala con la stagionalità del mese corrente
+            cap = max(1.3 * recent_avg * sf, p95)
+
+            # soft-cap: non tronchiamo, smorziamo l’eccesso
+            excess = base_value - cap
+            if excess > 0:
+                leak = 0.35  # 0 = cap duro, 1 = nessun cap
+                base_value = cap + leak * excess
+            # -----------------------------------------------
+
+            forecast_value = max(0.0, float(base_value))
+            std_dev = float(data.std()) if len(data) > 1 else (forecast_value * 0.3)
+
+            forecast_rows.append({
+                'ds':         forecast_date,
+                'yhat':       forecast_value,
+                'yhat_lower': max(0.0, forecast_value - 1.5 * std_dev),
                 'yhat_upper': forecast_value + 1.5 * std_dev
             })
 
-        return pd.DataFrame(forecast_data)
+        return pd.DataFrame(forecast_rows)
+
     except Exception as e:
         st.warning(f"Errore nel forecasting stagionale: {str(e)}. Uso modello semplificato.")
         return simple_forecast(data, periods)
@@ -1634,10 +1680,10 @@ def main():
         except Exception as e:
             st.error(f"Errore durante l'elaborazione del file movimenti: {str(e)}"); st.stop()
 
-        # >>> Shopify B2C baseline (se presente nel manifest)
+        # >>> Shopify B2C baseline (se presente nel manifest) — con matching su "sku_root" (tutto tranne ultime 2)
         b2c_base = _load_b2c_baseline_from_drive()
         if not b2c_base.empty:
-            # ---- 1) Normalizza df (movimenti) perché il merge richiede stesse colonne
+            # ---- 0) Normalizza df "non-baseline" per avere colonne richieste
             if "product_name" not in df.columns:
                 df["product_name"] = df["sku"]
             if "units_sold_b2b" not in df.columns:
@@ -1645,49 +1691,90 @@ def main():
             if "units_sold_b2c" not in df.columns:
                 df["units_sold_b2c"] = 0
 
-            # ---- 2) Normalizza b2c_base e CREA esplicitamente le colonne mancanti
-            # b2c_base ha: ["date","sku","product_name","units_sold"] (dalla funzione loader)
-            b2c_base_std = b2c_base.copy()
+            # ---- 1) Costruisci la root (tutto tranne ultime 2) sugli SKU del df (non-baseline)
+            def _root(s):
+                s = str(s) if pd.notna(s) else ""
+                return s[:-2] if len(s) >= 2 else s
 
+            df["sku_root"] = df["sku"].astype(str).map(_root)
+
+            # Mappa root -> SKU canonico (primo visto nel df)
+            root_to_canonical = (
+                df.groupby("sku_root", as_index=False)
+                .agg({"sku": "first"})
+                .set_index("sku_root")["sku"]
+                .to_dict()
+            )
+            allowed_roots = set(root_to_canonical.keys())
+
+            # Mappa SKU canonico -> nome prodotto (per rimpiazzare eventuali nomi baseline)
+            sku_to_name = (
+                df.groupby("sku", as_index=False)
+                .agg({"product_name": "first"})
+                .set_index("sku")["product_name"]
+                .to_dict()
+            )
+
+            # ---- 2) Normalizza baseline
+            b2c_base_std = b2c_base.copy()
             if "product_name" not in b2c_base_std.columns:
                 b2c_base_std["product_name"] = b2c_base_std["sku"]
-
-            # Tutto ciò che arriva da Shopify baseline è B2C:
-            # - mettiamo le vendite anche in "units_sold" (totale)
-            # - "units_sold_b2c" = units_sold baseline
-            # - "units_sold_b2b" = 0
             b2c_base_std["units_sold"] = pd.to_numeric(b2c_base_std["units_sold"], errors="coerce").fillna(0).astype(int)
             b2c_base_std["units_sold_b2b"] = 0
             b2c_base_std["units_sold_b2c"] = b2c_base_std["units_sold"]
 
-            # Selezione colonne allineata (ora esistono tutte)
-            b2c_base_std = b2c_base_std[["date","sku","product_name","units_sold","units_sold_b2b","units_sold_b2c"]]
+            # Root anche su baseline
+            b2c_base_std["sku_root"] = b2c_base_std["sku"].astype(str).map(_root)
 
-            # (opzionale) log di sicurezza
-            # st.caption(f"COL DF: {list(df.columns)}")
-            # st.caption(f"COL B2C_BASE: {list(b2c_base_std.columns)}")
+            # ---- 3) Tieni solo baseline i cui "root" compaiono nel df (non-baseline)
+            b2c_base_std = b2c_base_std[b2c_base_std["sku_root"].isin(allowed_roots)].copy()
+            if not b2c_base_std.empty:
+                # Rimpiazza SKU baseline con lo SKU canonico del df
+                b2c_base_std["sku"] = b2c_base_std["sku_root"].map(root_to_canonical)
 
-            # ---- 3) Concat + groupby coerente
-            merged = pd.concat(
-                [
-                    df[["date","sku","product_name","units_sold","units_sold_b2b","units_sold_b2c"]],
-                    b2c_base_std
-                ],
-                ignore_index=True
-            )
+                # Allinea nome al canonico se disponibile
+                b2c_base_std["product_name"] = b2c_base_std["sku"].map(sku_to_name).fillna(b2c_base_std["product_name"])
 
-            df = (
-                merged.groupby(["date","sku","product_name"], as_index=False)
-                    .agg({
+                # Tieni solo le colonne allineate
+                b2c_base_std = b2c_base_std[["date","sku","product_name","units_sold","units_sold_b2b","units_sold_b2c"]]
+
+                # ---- 3.5) Evita doppio conteggio: tieni baseline solo PRIMA della prima data presente nei file non-baseline per quel root
+                # (usa la sku_root già calcolata su df)
+                first_df_date = (
+                    df.groupby("sku_root", as_index=False)["date"]
+                    .min()
+                    .rename(columns={"date":"first_date"})
+                )
+
+                # unisci e filtra
+                b2c_base_std = b2c_base_std.merge(first_df_date, on="sku_root", how="left")
+                b2c_base_std = b2c_base_std[
+                    b2c_base_std["first_date"].isna() | (b2c_base_std["date"] < b2c_base_std["first_date"])
+                ].drop(columns="first_date")
+
+                # ---- 4) Concat + groupby (per data/sku/prodotto)
+                merged = pd.concat(
+                    [
+                        df[["date","sku","product_name","units_sold","units_sold_b2b","units_sold_b2c"]],
+                        b2c_base_std
+                    ],
+                    ignore_index=True
+                )
+
+                df = (
+                    merged.groupby(["date","sku","product_name"], as_index=False)
+                        .agg({
                             "units_sold": "sum",
                             "units_sold_b2b": "sum",
                             "units_sold_b2c": "sum"
-                    })
-            )
+                        })
+                        .sort_values("date")
+                        .reset_index(drop=True)
+                )
 
-            st.info(f"🧩 Storico B2C extra unito: {len(b2c_base)} righe baseline aggiunte")
-
-
+                st.info(f"🧩 Storico B2C baseline unito: {len(b2c_base_std)} righe (solo prodotti presenti nei file, con raggruppo -2).")
+            else:
+                st.caption("Baseline presente ma nessun SKU-root combacia con i file correnti: nessuna riga aggiunta.")
 
         # === STOCK: leggi sempre dai bytes in sessione ===
         try:
