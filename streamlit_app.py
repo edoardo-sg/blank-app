@@ -113,7 +113,7 @@ def get_last_saved_drive(kind: str) -> dict | None:
 
 
 # --- Google Drive via Service Account (PyDrive2) ---
-def _drive_client():
+def _drive_client(show_banner: bool = False):
     from pydrive2.auth import GoogleAuth
     from pydrive2.drive import GoogleDrive
     import json
@@ -127,48 +127,46 @@ def _drive_client():
     # --- carica credenziali SA ---
     sa_dict = None
     if "google_sa" in st.secrets:
-        sa_dict = dict(st.secrets["google_sa"])          # già dict
+        sa_dict = dict(st.secrets["google_sa"])
     else:
         sa_json = st.secrets.get("GDRIVE_SA_JSON") or os.getenv("GDRIVE_SA_JSON")
         if not sa_json:
             raise RuntimeError("Credenziali SA non trovate: definisci [google_sa] o GDRIVE_SA_JSON")
         if isinstance(sa_json, str):
-            # è già stringa JSON → usala così com'è
             client_json_str = sa_json
         elif isinstance(sa_json, dict):
-            # è dict → DUMPS a stringa JSON
             client_json_str = json.dumps(sa_json)
         else:
             raise RuntimeError("GDRIVE_SA_JSON deve essere stringa JSON o dict")
 
-    # se avevi [google_sa], serializza a stringa JSON qui
     if sa_dict is not None:
         client_json_str = json.dumps(sa_dict)
 
     settings = {
         "client_config_backend": "service",
         "service_config": {
-            # 👉 PyDrive2 vuole una STRINGA JSON
             "client_json": client_json_str
         },
         "oauth_scope": ["https://www.googleapis.com/auth/drive"]
     }
     if subject:
-        settings["service_config"]["client_user_email"] = subject  # impersonation
+        settings["service_config"]["client_user_email"] = subject
 
     gauth = GoogleAuth(settings=settings)
     gauth.ServiceAuth()
     drive = GoogleDrive(gauth)
 
-        # 👇 Diagnostica: chi sono?
-    try:
-        about = drive.GetAbout()
-        st.info(f"🔐 Autenticato come: {about.get('user', {}).get('emailAddress', 'sconosciuto')}")
-    except Exception as e:
-        st.warning(f"Impossibile leggere About: {e}")
+    # 👇 Mostra il banner SOLO se richiesto e non ancora mostrato
+    if show_banner and not st.session_state.get("_drive_banner_shown", False):
+        try:
+            about = drive.GetAbout()
+            st.info(f"🔐 Autenticato come: {about.get('user', {}).get('emailAddress', 'sconosciuto')}")
+        except Exception as e:
+            st.warning(f"Impossibile leggere About: {e}")
+        finally:
+            st.session_state["_drive_banner_shown"] = True
 
     return drive, folder_id
-
 
 def _sha1(b: bytes) -> str:
     return hashlib.sha1(b).hexdigest()[:10]
@@ -1118,7 +1116,6 @@ def forecast_with_monthly_seasonality(data, periods, all_products_data=None, cur
         growth_rate = calculate_growth_rate(data, all_products_data=all_products_data, months_to_compare=3)
         # guard-rail: limita outlier YoY (−50% … +80%)
         growth_rate = float(np.clip(growth_rate, -0.5, 0.8))
-        st.info(f"📈 Tasso di crescita rilevato: {growth_rate*100:.1f}%")
 
         # pesi OOS più “stringenti”
         daily_series_for_weights = data.copy().sort_index().resample('D').sum().fillna(0)
@@ -1909,108 +1906,80 @@ def main():
                     except Exception:
                         pass
 
+        # --- Costruisci le opzioni Ag-Grid (larghezze auto, prodotto fisso & più largo) ---
+        col_product = "Nome Prodotto"
 
-
-        # Costruisci le opzioni Ag-Grid
         gb = GridOptionsBuilder.from_dataframe(show_df)
 
-        # ID riga stabile = SKU (serve anche a non perdere la selezione)
+        # ID riga stabile
         gb.configure_grid_options(
             getRowId=JsCode("function(p){return p.data && (p.data.SKU || p.data.sku);}"),
         )
 
-        # Metti il checkbox nella colonna SKU (prima colonna)
+        # SKU con checkbox
         gb.configure_column(
             "SKU",
-            pinned="left",                # SKU resta la prima a sinistra
-            checkboxSelection=True,       # checkbox dentro la colonna SKU
+            pinned=None,
+            checkboxSelection=True,
             headerCheckboxSelection=False,
             suppressSizeToFit=False
         )
 
-        # Lascia "Nome Prodotto" non per forza pinned, così lo SKU+checkbox rimangono davvero primi
+        # Colonna prodotto: pin a sinistra, non partecipa al fit, più larga
         gb.configure_column(
-            "Nome Prodotto",
-            pinned=None,                  # <— togli il "left" qui se vuoi davvero prima lo SKU
-            suppressSizeToFit=True,
+            col_product,
+            pinned="left",
+            suppressSizeToFit=True,   # non viene ristretta dallo sizeColumnsToFit
             wrapText=True,
             autoHeight=True,
             headerTooltip="Nome Prodotto",
             cellStyle={"white-space": "normal"},
             filter="agTextColumnFilter",
-            floatingFilter=True
+            floatingFilter=True,
+            minWidth=340               # leggermente più largo
         )
 
-
-        # Etichetta UI desiderata
-        prev_col_label = f"Prev Tot ({forecast_days} gg)"
-
-        # Header dinamico sulla colonna forecast tenendo il field fisso
-        gb.configure_column(
-            "forecast_tot",
-            headerName=prev_col_label,
-            type=["numericColumn"]
-        )
-
-        # Default: niente filtri sulle colonne
+        # Default colonne
         gb.configure_default_column(resizable=True, filter=False, floatingFilter=False)
 
+        # Tutte le altre colonne si adattano (flex) e partecipano al fit
+        for c in [c for c in show_df.columns if c != col_product]:
+            gb.configure_column(c, flex=1, suppressSizeToFit=False)
 
-        # SKU: si adatta (NO suppress), allineamento a sinistra
-        gb.configure_column("SKU", pinned=None, suppressSizeToFit=False)
+        # Header dinamico forecast
+        gb.configure_column("forecast_tot", headerName=f"Prev Tot ({forecast_days} gg)", type=["numericColumn"])
 
-        gb.configure_column(
-            "Nome Prodotto",
-            pinned="left",
-            suppressSizeToFit=True,
-            wrapText=True,
-            autoHeight=True,
-            headerTooltip="Nome Prodotto",
-            cellStyle={"white-space": "normal"},
-            filter="agTextColumnFilter",     # ← filtro SOLO su questa colonna
-            floatingFilter=True
-        )
-
-        # Tutte le altre colonne si adattano con flex
-        for col in [c for c in show_df.columns if c not in ["Nome Prodotto"]]:
-            gb.configure_column(col, flex=1, suppressSizeToFit=False)
-
-        # editor numerico robusto (coercizione lato grid)
-        num_parser = JsCode("function(params){ var v = Number(params.newValue); return isNaN(v) ? null : Math.round(v); }")
-
-        gb.configure_column("MOQ", editable=True, type=["numericColumn"], valueParser=num_parser, cellEditor='agTextCellEditor')
-        gb.configure_column("Lead Time", editable=True, type=["numericColumn"], valueParser=num_parser, cellEditor='agTextCellEditor')
-        gb.configure_grid_options(stopEditingWhenCellsLoseFocus=True)
-
-        # Selezione riga singola con checkbox
+        # Selezione/UX
         gb.configure_selection(selection_mode="single", use_checkbox=True)
+        gb.configure_grid_options(stopEditingWhenCellsLoseFocus=True, pagination=False, domLayout='normal')
 
-        # No paginazione
-        gb.configure_grid_options(pagination=False, domLayout='normal')
-
-        # JS: fit di tutte le colonne tranne "Nome Prodotto"; poi imposta una minWidth decente al nome
+        # Autosize: 1) autosize a contenuto (escludendo Nome Prodotto) 2) fit al viewport 3) assicura min larghezza al prodotto
         gb.configure_grid_options(
-            onFirstDataRendered=JsCode("""
-                function(params){
-                    // 1) Fit di tutte le colonne (quelle con suppressSizeToFit=True sono escluse)
-                    params.api.sizeColumnsToFit();
+            onFirstDataRendered=JsCode(f"""
+                function(params){{
+                var allCols = params.columnApi.getAllColumns().map(c => c.getColId());
+                var exclude = ['{col_product}'];
+                var toSize = allCols.filter(id => exclude.indexOf(id) === -1);
 
-                    // 2) Dai un minimo di larghezza al Nome Prodotto e abilita header wrap
-                    try {
-                        var col = params.columnApi.getColumn('Nome Prodotto');
-                        if (col && col.getColDef()) {
-                            // min larghezza per leggere bene
-                            params.columnApi.setColumnWidths([{ key: 'Nome Prodotto', newWidth: Math.max(col.getActualWidth(), 260) }]);
-                            col.getColDef().wrapHeaderText = true;
-                            col.getColDef().autoHeaderHeight = true;
-                            params.api.refreshHeader();
-                        }
-                    } catch(e) {}
-                }
+                // 1) autosize a contenuto per le colonne non-prodotto
+                params.columnApi.autoSizeColumns(toSize, false);
+
+                // 2) adatta la tabella alla larghezza (il prodotto è escluso dal fit)
+                params.api.sizeColumnsToFit();
+
+                // 3) assicura il prodotto "leggermente più largo"
+                try {{
+                    var pcol = params.columnApi.getColumn('{col_product}');
+                    var cur  = pcol.getActualWidth();
+                    var want = Math.max(cur, 360);
+                    params.columnApi.setColumnWidths([{{ key: '{col_product}', newWidth: want }}]);
+                }} catch(e) {{}}
+                }}
             """)
         )
 
         grid_options = gb.build()
+
 
         grid_response = AgGrid(
             show_df,
