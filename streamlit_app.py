@@ -1637,21 +1637,56 @@ def main():
         # >>> Shopify B2C baseline (se presente nel manifest)
         b2c_base = _load_b2c_baseline_from_drive()
         if not b2c_base.empty:
-            # uniforma eventuali colonne mancanti
-            for c in ["date","sku","product_name","units_sold","units_sold_b2b","units_sold_b2c"]:
-                if c not in df.columns:
-                    df[c] = 0 if c.startswith("units_") else df.get(c, "")
+            # ---- 1) Normalizza df (movimenti) perché il merge richiede stesse colonne
+            if "product_name" not in df.columns:
+                df["product_name"] = df["sku"]
+            if "units_sold_b2b" not in df.columns:
+                df["units_sold_b2b"] = 0
+            if "units_sold_b2c" not in df.columns:
+                df["units_sold_b2c"] = 0
 
+            # ---- 2) Normalizza b2c_base e CREA esplicitamente le colonne mancanti
+            # b2c_base ha: ["date","sku","product_name","units_sold"] (dalla funzione loader)
+            b2c_base_std = b2c_base.copy()
+
+            if "product_name" not in b2c_base_std.columns:
+                b2c_base_std["product_name"] = b2c_base_std["sku"]
+
+            # Tutto ciò che arriva da Shopify baseline è B2C:
+            # - mettiamo le vendite anche in "units_sold" (totale)
+            # - "units_sold_b2c" = units_sold baseline
+            # - "units_sold_b2b" = 0
+            b2c_base_std["units_sold"] = pd.to_numeric(b2c_base_std["units_sold"], errors="coerce").fillna(0).astype(int)
+            b2c_base_std["units_sold_b2b"] = 0
+            b2c_base_std["units_sold_b2c"] = b2c_base_std["units_sold"]
+
+            # Selezione colonne allineata (ora esistono tutte)
+            b2c_base_std = b2c_base_std[["date","sku","product_name","units_sold","units_sold_b2b","units_sold_b2c"]]
+
+            # (opzionale) log di sicurezza
+            # st.caption(f"COL DF: {list(df.columns)}")
+            # st.caption(f"COL B2C_BASE: {list(b2c_base_std.columns)}")
+
+            # ---- 3) Concat + groupby coerente
             merged = pd.concat(
-                [df[["date","sku","product_name","units_sold","units_sold_b2b","units_sold_b2c"]],
-                b2c_base[["date","sku","product_name","units_sold","units_sold_b2b","units_sold_b2c"]]],
+                [
+                    df[["date","sku","product_name","units_sold","units_sold_b2b","units_sold_b2c"]],
+                    b2c_base_std
+                ],
                 ignore_index=True
             )
-            df = (merged.groupby(["date","sku","product_name"], as_index=False)
-                    .agg({"units_sold":"sum",
-                            "units_sold_b2b":"sum",
-                            "units_sold_b2c":"sum"}))
+
+            df = (
+                merged.groupby(["date","sku","product_name"], as_index=False)
+                    .agg({
+                            "units_sold": "sum",
+                            "units_sold_b2b": "sum",
+                            "units_sold_b2c": "sum"
+                    })
+            )
+
             st.info(f"🧩 Storico B2C extra unito: {len(b2c_base)} righe baseline aggiunte")
+
 
 
         # === STOCK: leggi sempre dai bytes in sessione ===
