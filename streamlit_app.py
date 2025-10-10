@@ -430,6 +430,12 @@ def load_translations():
 # -------------------------------
 # Utils
 # -------------------------------
+
+def _month_anchor():
+    # primo giorno del mese corrente alle 00:00 (naive)
+    today = pd.Timestamp.today().normalize()
+    return pd.Timestamp(year=today.year, month=today.month, day=1)
+
 def find_column(df, possible_names):
     cols_norm = {str(c): str(c).lower().strip().replace('\ufeff','') for c in df.columns}
     for col, norm in cols_norm.items():
@@ -817,11 +823,14 @@ def _parse_stock_from_bytes(data: bytes, name: str) -> pd.DataFrame:
     df.columns = [str(c).strip().replace('\ufeff','') for c in df.columns]
     return process_stock_file(df)
 
-def simple_forecast(ts_data, periods):
+def simple_forecast(ts_data, periods, anchor_date=None):
+    # ancora = primo giorno del mese corrente se non specificata
+    anchor = (anchor_date or _month_anchor())
+    last_date = anchor - timedelta(days=1)  # così i=1 => 1° giorno del mese
+
     if len(ts_data) < 2:
         avg_value = ts_data.mean() if len(ts_data) > 0 else 1
         forecast_data = []
-        last_date = ts_data.index[-1] if len(ts_data) > 0 else datetime.now()
         for i in range(1, periods + 1):
             forecast_date = last_date + timedelta(days=i)
             forecast_data.append({
@@ -837,10 +846,7 @@ def simple_forecast(ts_data, periods):
     z = np.polyfit(x, y, 1)
     trend_slope = z[0]
 
-    if len(y) >= 7:
-        y_smooth = pd.Series(y).rolling(window=7, min_periods=1).mean().values
-    else:
-        y_smooth = y
+    y_smooth = pd.Series(y).rolling(window=7, min_periods=1).mean().values if len(y) >= 7 else y
     last_value = y_smooth[-1]
 
     weekly_pattern = np.ones(7)
@@ -851,7 +857,6 @@ def simple_forecast(ts_data, periods):
                 weekly_pattern[day] = np.mean(day_values) / np.mean(y)
 
     forecast_data = []
-    last_date = ts_data.index[-1]
     for i in range(1, periods + 1):
         forecast_date = last_date + timedelta(days=i)
         base_value = last_value + trend_slope * i
@@ -1103,7 +1108,8 @@ def forecast_with_monthly_seasonality(data, periods, all_products_data=None, cur
         data_df.columns = ['date','sales']
         data_df['month'] = data_df['date'].dt.month
         data_df['year']  = data_df['date'].dt.year
-        last_date = data_df['date'].max()
+        anchor = ( _month_anchor() )
+        last_date = anchor - timedelta(days=1)  # i=1 => 1° del mese
 
         # mensile storico del singolo SKU (serve per pari mese a.a.)
         monthly_sales = data_df.groupby(['year','month'])['sales'].sum().reset_index()
@@ -1969,9 +1975,11 @@ def main():
         for col in [c for c in show_df.columns if c not in ["Nome Prodotto"]]:
             gb.configure_column(col, flex=1, suppressSizeToFit=False)
 
-        # Editing per MOQ e Lead Time
-        gb.configure_column("MOQ", editable=True, type=["numericColumn"])
-        gb.configure_column("Lead Time", editable=True, type=["numericColumn"])
+        # editor numerico robusto (coercizione lato grid)
+        num_parser = JsCode("function(params){ var v = Number(params.newValue); return isNaN(v) ? null : Math.round(v); }")
+
+        gb.configure_column("MOQ", editable=True, type=["numericColumn"], valueParser=num_parser, cellEditor='agTextCellEditor')
+        gb.configure_column("Lead Time", editable=True, type=["numericColumn"], valueParser=num_parser, cellEditor='agTextCellEditor')
         gb.configure_grid_options(stopEditingWhenCellsLoseFocus=True)
 
         # Selezione riga singola con checkbox
@@ -2004,12 +2012,11 @@ def main():
 
         grid_options = gb.build()
 
-
         grid_response = AgGrid(
             show_df,
             gridOptions=grid_options,
-            data_return_mode=DataReturnMode.AS_INPUT,
-            update_mode=GridUpdateMode.SELECTION_CHANGED,   # ← niente VALUE_CHANGED
+            data_return_mode=DataReturnMode.AS_INPUT,                    # <-- serve per ottenere i dati editati
+            update_mode=GridUpdateMode.VALUE_CHANGED | GridUpdateMode.SELECTION_CHANGED,  # <-- cattura anche gli edit
             allow_unsafe_jscode=True,
             fit_columns_on_grid_load=False,
             theme="balham",
@@ -2018,26 +2025,44 @@ def main():
             enable_enterprise_modules=False
         )
 
-                # --- Persistenza MOQ / Lead Time da griglia ---
+        # --- Persistenza MOQ / Lead Time da griglia (UNICO punto di salvataggio) ---
         edited_df = pd.DataFrame(grid_response.get("data", show_df)).copy()
-        # Normalizza colonne attese
-        if not edited_df.empty:
-            for col in ["SKU", "MOQ", "Lead Time"]:
-                if col not in edited_df.columns:
-                    st.error(f"Manca la colonna {col} nella griglia, impossibile salvare impostazioni.")
-                    st.stop()
-            # Prepara il dataframe impostazioni
-            settings_df = edited_df[["SKU", "MOQ", "Lead Time"]].rename(columns={"SKU":"sku","Lead Time":"lead_time","MOQ":"moq"})
-            # Coerce numerici
+
+        required_cols = {"SKU", "MOQ", "Lead Time"}
+        if required_cols.issubset(set(edited_df.columns)):
+            # prepara df impostazioni
+            settings_df = edited_df[["SKU", "MOQ", "Lead Time"]].rename(
+                columns={"SKU":"sku","Lead Time":"lead_time","MOQ":"moq"}
+            ).copy()
+
+            # coercizione robusta e limiti minimi
             settings_df["sku"] = settings_df["sku"].astype(str).str.strip()
-            settings_df["moq"] = pd.to_numeric(settings_df["moq"], errors="coerce").fillna(1).astype(int)
-            settings_df["lead_time"] = pd.to_numeric(settings_df["lead_time"], errors="coerce").fillna(7).astype(int)
+            settings_df["moq"] = pd.to_numeric(settings_df["moq"], errors="coerce").fillna(1).clip(lower=1).astype(int)
+            settings_df["lead_time"] = pd.to_numeric(settings_df["lead_time"], errors="coerce").fillna(7).clip(lower=0).astype(int)
 
-            # Salva in sessione per uso immediato nel dettaglio
-            st.session_state.product_settings = settings_df.copy()
+            # confronta con stato precedente (evita salvataggi inutili)
+            def _norm(df):
+                if df is None or df.empty:
+                    return pd.DataFrame(columns=["sku","moq","lead_time"])
+                out = df[["sku","moq","lead_time"]].copy()
+                out["sku"] = out["sku"].astype(str)
+                out["moq"] = pd.to_numeric(out["moq"], errors="coerce").fillna(1).astype(int)
+                out["lead_time"] = pd.to_numeric(out["lead_time"], errors="coerce").fillna(7).astype(int)
+                return out.sort_values("sku").reset_index(drop=True)
 
-            # Scrivi su disco
-            save_product_settings(settings_df)
+            prev = _norm(st.session_state.get("product_settings"))
+            curr = _norm(settings_df)
+
+            if not prev.equals(curr):
+                # aggiorna sessione + file
+                st.session_state.product_settings = curr.copy()
+                save_product_settings(curr)
+                st.toast("✅ Impostazioni prodotto salvate (MOQ / Lead Time).", icon="💾")
+                # le impostazioni impattano sui calcoli → rifai il run così le vedi subito
+                st.experimental_rerun()
+        else:
+            st.warning("Non trovo le colonne SKU / MOQ / Lead Time nella griglia: impossibile salvare.", icon="⚠️")
+
 
         # --- Gestione selezione robusta ---
         selected_rows = grid_response.get("selected_rows", [])
@@ -2093,18 +2118,6 @@ def main():
         if not sku_show:
             st.error(f"Chiavi disponibili nella riga selezionata: {list(selected_row.keys())}")
             st.stop()
-
-        # Leggi eventuali modifiche a MOQ/Lead Time e salvale come prima
-        edited_df = pd.DataFrame(grid_response["data"])
-        new_settings = []
-        for _, row in edited_df.iterrows():
-            new_settings.append({
-                'sku': row['SKU'],
-                'moq': int(row['MOQ']),
-                'lead_time': int(row['Lead Time'])
-            })
-        st.session_state.product_settings = pd.DataFrame(new_settings)
-        save_product_settings(st.session_state.product_settings)
 
         # --- Recupero riga selezionata da Ag-Grid (robusto) ---
         selected_rows = grid_response.get("selected_rows", [])
