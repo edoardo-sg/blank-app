@@ -1599,14 +1599,53 @@ def main():
             mask = show_df["Nome Prodotto"].astype(str).str.contains(search_name, case=False, na=False)
             show_df = show_df[mask].reset_index(drop=True)
 
-            # Se la selezione salvata non è più visibile, azzero
-            if st.session_state.get('selected_sku') and st.session_state['selected_sku'] not in set(show_df['SKU']):
-                st.session_state.pop('selected_sku', None)
-                st.session_state.pop('selected_name', None)
+            # Selezione persistente: se la riga è nascosta dal filtro, NON azzero
+            selected_hidden = False
+            if st.session_state.get('selected_sku'):
+                sku_sel = str(st.session_state['selected_sku'])
+                visible_skus = set(show_df['SKU'].astype(str))
+                if sku_sel not in visible_skus:
+                    selected_hidden = True
+                    # prova a recuperare il nome dal dataset completo (results_df), non filtrato
+                    try:
+                        rec_all = results_df[results_df['sku'].astype(str) == sku_sel].head(1)
+                        if not rec_all.empty:
+                            st.session_state['selected_name'] = rec_all['name'].iloc[0]
+                    except Exception:
+                        pass
+
 
 
         # Costruisci le opzioni Ag-Grid
         gb = GridOptionsBuilder.from_dataframe(show_df)
+
+        # ID riga stabile = SKU (serve anche a non perdere la selezione)
+        gb.configure_grid_options(
+            getRowId=JsCode("function(p){return p.data && (p.data.SKU || p.data.sku);}"),
+        )
+
+        # Metti il checkbox nella colonna SKU (prima colonna)
+        gb.configure_column(
+            "SKU",
+            pinned="left",                # SKU resta la prima a sinistra
+            checkboxSelection=True,       # checkbox dentro la colonna SKU
+            headerCheckboxSelection=False,
+            suppressSizeToFit=False
+        )
+
+        # Lascia "Nome Prodotto" non per forza pinned, così lo SKU+checkbox rimangono davvero primi
+        gb.configure_column(
+            "Nome Prodotto",
+            pinned=None,                  # <— togli il "left" qui se vuoi davvero prima lo SKU
+            suppressSizeToFit=True,
+            wrapText=True,
+            autoHeight=True,
+            headerTooltip="Nome Prodotto",
+            cellStyle={"white-space": "normal"},
+            filter="agTextColumnFilter",
+            floatingFilter=True
+        )
+
 
         # Etichetta UI desiderata
         prev_col_label = f"Prev Tot ({forecast_days} gg)"
@@ -1680,8 +1719,8 @@ def main():
         grid_response = AgGrid(
             show_df,
             gridOptions=grid_options,
-            data_return_mode=DataReturnMode.AS_INPUT,     # ← restituisce i valori correnti, anche se non c’è rerun
-            update_mode=GridUpdateMode.VALUE_CHANGED | GridUpdateMode.SELECTION_CHANGED,
+            data_return_mode=DataReturnMode.AS_INPUT,
+            update_mode=GridUpdateMode.SELECTION_CHANGED,   # ← niente VALUE_CHANGED
             allow_unsafe_jscode=True,
             fit_columns_on_grid_load=False,
             theme="balham",
@@ -1711,20 +1750,45 @@ def main():
             # Scrivi su disco
             save_product_settings(settings_df)
 
-
+        # --- Gestione selezione robusta ---
         selected_rows = grid_response.get("selected_rows", [])
         if isinstance(selected_rows, pd.DataFrame):
             selected_rows = selected_rows.to_dict("records")
 
-        if not selected_rows:
-            prev = st.session_state.get('selected_sku')
-            if prev:
-                fallback_row = show_df[show_df['SKU'] == prev].head(1).to_dict("records")
-                selected_rows = fallback_row
+        # Aggiorna la sessione solo quando l'utente seleziona
+        if selected_rows:
+            sr = selected_rows[0]
+            sku_clicked  = sr.get("SKU") or sr.get("sku")
+            name_clicked = sr.get("Nome Prodotto") or sr.get("name")
+            if sku_clicked:
+                st.session_state["selected_sku"]  = sku_clicked
+                st.session_state["selected_name"] = name_clicked
 
-        if not selected_rows:
+        # Usa sempre la selezione salvata
+        sku_show  = st.session_state.get("selected_sku")
+        name_show = st.session_state.get("selected_name")
+
+        # Se la riga selezionata è nascosta dal filtro, NON azzerare: prova a recuperare il nome dal dataset completo
+        selected_hidden = False
+        if sku_show is not None:
+            visible_skus = set(show_df["SKU"].astype(str))
+            if str(sku_show) not in visible_skus:
+                selected_hidden = True
+                try:
+                    rec_all = results_df[results_df["sku"].astype(str) == str(sku_show)].head(1)
+                    if not rec_all.empty:
+                        name_show = rec_all["name"].iloc[0]
+                        st.session_state["selected_name"] = name_show
+                except Exception:
+                    pass
+
+        if not sku_show:
             st.info("Seleziona un prodotto nella tabella per vedere il dettaglio.")
             st.stop()
+
+        if selected_hidden:
+            st.caption("La riga selezionata è temporaneamente nascosta dal filtro. Il dettaglio resta visibile.")
+
 
         selected_row = selected_rows[0]
         sku_show  = selected_row.get("SKU") or selected_row.get("sku")
