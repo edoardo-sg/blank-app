@@ -715,80 +715,78 @@ def _load_b2c_baseline_from_drive() -> pd.DataFrame:
     raw = gdrive_get_file_content(rec["file_id"])
     bio = io.BytesIO(raw)
 
-    # Leggi tutto come stringhe per non perdere formati
+    # 1) Leggi, pulisci header ed evita NA "magici"
     df = pd.read_csv(bio, dtype=str, keep_default_na=False)
+    df.columns = df.columns.astype(str).str.replace('\ufeff', '', regex=False).str.strip()
 
-    # Helper per trovare colonne, prima match esatto poi substring
-    def _pick(df, names_exact, names_sub):
-        cols = list(df.columns)
+    # 2) Pick colonne
+    def _pick(_df, names_exact, names_sub):
+        cols = list(_df.columns)
         norm = {c: str(c).strip() for c in cols}
-        # esatto
         for target in names_exact:
             for c in cols:
                 if norm[c].lower() == target.lower():
                     return c
-        # substring
         for target in names_sub:
             for c in cols:
                 if target.lower() in norm[c].lower():
                     return c
         return None
 
-    date_col = _pick(
-        df,
+    date_col = _pick(df,
         names_exact=["Created at", "Processed at", "Paid at", "Order Date"],
-        names_sub=["created", "processed", "paid", "date"]
-    )
-    sku_col = _pick(
-        df,
+        names_sub=["created", "processed", "paid", "date"])
+    sku_col  = _pick(df,
         names_exact=["Lineitem sku", "Variant SKU", "SKU"],
-        names_sub=["sku"]
-    )
-    qty_col = _pick(
-        df,
+        names_sub=["sku"])
+    qty_col  = _pick(df,
         names_exact=["Lineitem quantity", "Quantity"],
-        names_sub=["quantity", "qty"]
-    )
-    name_col = _pick(
-        df,
+        names_sub=["quantity", "qty"])
+    name_col = _pick(df,
         names_exact=["Lineitem name", "Product Title", "Title", "Name"],
-        names_sub=["name", "title"]
-    )
+        names_sub=["name", "title"])
 
     if not date_col or not sku_col or not qty_col:
-        # colonne minime non trovate → ritorna vuoto
         return pd.DataFrame()
 
     out = df[[date_col, sku_col, qty_col] + ([name_col] if name_col else [])].copy()
 
-    # Parse datetime ROBUSTO
-    out["date"] = pd.to_datetime(out[date_col], errors="coerce", utc=False)
-    # Nota: se Shopify esporta in ISO con timezone, puoi forzare:
-    # out["date"] = pd.to_datetime(out[date_col], errors="coerce", utc=True).dt.tz_convert(None)
+    # 3) Parse datetime *davvero* robusto (forza tz→naive e normalizza al giorno)
+    #    - utc=True gestisce ISO con timezone
+    #    - tz_convert(None) toglie la tz
+    #    - normalize() porta a mezzanotte (giorno)
+    out["date"] = (
+        pd.to_datetime(out[date_col], errors="coerce", utc=True)
+          .dt.tz_convert(None)
+    )
 
+    # Drop righe senza data valida
     out = out.dropna(subset=["date"])
+
+    # 4) SKU / Nome
     out["sku"] = out[sku_col].astype(str).str.strip()
     out["product_name"] = out[name_col].astype(str).str.strip() if name_col else out["sku"]
 
-    # Quantità
+    # 5) Quantità
     q = pd.to_numeric(out[qty_col].str.replace(",", ".", regex=False), errors="coerce").fillna(0)
     out["units_sold"] = q.astype(int)
 
-    # Solo righe utili (sku non vuoti e qty>0)
+    # 6) Righe utili
     out = out[(out["sku"] != "") & (out["units_sold"] > 0)].copy()
 
-    # Aggrega per giorno/SKU (se nel CSV ci sono più righe al giorno)
-    out = (
-        out.groupby([out["date"].dt.normalize(), "sku", "product_name"], as_index=False)["units_sold"]
-           .sum()
-           .rename(columns={"date": "date"})
-           .sort_values("date")
-           .reset_index(drop=True)
-    )
+    # 7) Crea UNA colonna datagiorno SENZA usare .dt nel groupby
+    out["date_day"] = out["date"].dt.normalize()  # ora è sicuramente datetimelike
+
+    agg = (out.groupby(["date_day", "sku", "product_name"], as_index=False)["units_sold"]
+              .sum()
+              .rename(columns={"date_day": "date"})
+              .sort_values("date")
+              .reset_index(drop=True))
 
     # Garantisce dtype datetime64[ns]
-    out["date"] = pd.to_datetime(out["date"], errors="coerce")
-    return out[["date", "sku", "product_name", "units_sold"]]
+    agg["date"] = pd.to_datetime(agg["date"], errors="coerce")
+    return agg[["date", "sku", "product_name", "units_sold"]]
+
 
 @st.cache_data
 def _parse_movements_from_bytes(data: bytes, name: str) -> pd.DataFrame:
@@ -1636,24 +1634,24 @@ def main():
         except Exception as e:
             st.error(f"Errore durante l'elaborazione del file movimenti: {str(e)}"); st.stop()
 
-            # >>> Shopify B2C baseline (se presente nel manifest)
-            b2c_base = _load_b2c_baseline_from_drive()
-            if not b2c_base.empty:
-                # uniforma eventuali colonne mancanti
-                for c in ["date","sku","product_name","units_sold","units_sold_b2b","units_sold_b2c"]:
-                    if c not in df.columns:
-                        df[c] = 0 if c.startswith("units_") else df.get(c, "")
+        # >>> Shopify B2C baseline (se presente nel manifest)
+        b2c_base = _load_b2c_baseline_from_drive()
+        if not b2c_base.empty:
+            # uniforma eventuali colonne mancanti
+            for c in ["date","sku","product_name","units_sold","units_sold_b2b","units_sold_b2c"]:
+                if c not in df.columns:
+                    df[c] = 0 if c.startswith("units_") else df.get(c, "")
 
-                merged = pd.concat(
-                    [df[["date","sku","product_name","units_sold","units_sold_b2b","units_sold_b2c"]],
-                    b2c_base[["date","sku","product_name","units_sold","units_sold_b2b","units_sold_b2c"]]],
-                    ignore_index=True
-                )
-                df = (merged.groupby(["date","sku","product_name"], as_index=False)
-                        .agg({"units_sold":"sum",
-                                "units_sold_b2b":"sum",
-                                "units_sold_b2c":"sum"}))
-                st.info(f"🧩 Storico B2C extra unito: {len(b2c_base)} righe baseline aggiunte")
+            merged = pd.concat(
+                [df[["date","sku","product_name","units_sold","units_sold_b2b","units_sold_b2c"]],
+                b2c_base[["date","sku","product_name","units_sold","units_sold_b2b","units_sold_b2c"]]],
+                ignore_index=True
+            )
+            df = (merged.groupby(["date","sku","product_name"], as_index=False)
+                    .agg({"units_sold":"sum",
+                            "units_sold_b2b":"sum",
+                            "units_sold_b2c":"sum"}))
+            st.info(f"🧩 Storico B2C extra unito: {len(b2c_base)} righe baseline aggiunte")
 
 
         # === STOCK: leggi sempre dai bytes in sessione ===
