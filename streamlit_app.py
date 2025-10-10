@@ -702,69 +702,93 @@ def process_excel_data(df):
         return pd.DataFrame()
 
 def _load_b2c_baseline_from_drive() -> pd.DataFrame:
-    rec = get_b2c_baseline_record()
-    if not rec:
-        return pd.DataFrame()
-    try:
-        raw = gdrive_get_file_content(rec["file_id"])
-        bio = io.BytesIO(raw); bio.name = rec["title"]
-        # lettura robusta
-        try:
-            df = pd.read_csv(bio, encoding="utf-8-sig")
-            if df.shape[1] == 1:
-                bio.seek(0); df = pd.read_csv(bio, encoding="utf-8-sig", sep=";")
-        except Exception:
-            bio.seek(0); df = pd.read_csv(bio, encoding="latin-1")
-    except Exception:
+    """
+    Legge la baseline B2C (CSV Shopify) da Drive, la normalizza e ritorna
+    colonne: date, sku, product_name, units_sold
+    """
+    import io
+    man = _load_manifest()
+    rec = man.get("b2c_baseline")
+    if not rec or not rec.get("file_id"):
         return pd.DataFrame()
 
-    cols = {str(c).strip(): c for c in df.columns}
-    def pick(*names):
-        for n in names:
-            if n in cols: return cols[n]
-        # fallback case-insensitive
-        lower = {k.lower(): k for k in cols}
-        for n in names:
-            if n.lower() in lower: return lower[n.lower()]
+    raw = gdrive_get_file_content(rec["file_id"])
+    bio = io.BytesIO(raw)
+
+    # Leggi tutto come stringhe per non perdere formati
+    df = pd.read_csv(bio, dtype=str, keep_default_na=False)
+
+    # Helper per trovare colonne, prima match esatto poi substring
+    def _pick(df, names_exact, names_sub):
+        cols = list(df.columns)
+        norm = {c: str(c).strip() for c in cols}
+        # esatto
+        for target in names_exact:
+            for c in cols:
+                if norm[c].lower() == target.lower():
+                    return c
+        # substring
+        for target in names_sub:
+            for c in cols:
+                if target.lower() in norm[c].lower():
+                    return c
         return None
 
-    c_date_paid = pick("Paid at")
-    c_date_crea = pick("Created at")
-    c_ord       = pick("Name")
-    c_sku       = pick("Lineitem sku")
-    c_qty       = pick("Lineitem quantity")
-    c_pname     = pick("Lineitem name")
-    c_fin       = pick("Financial Status")
+    date_col = _pick(
+        df,
+        names_exact=["Created at", "Processed at", "Paid at", "Order Date"],
+        names_sub=["created", "processed", "paid", "date"]
+    )
+    sku_col = _pick(
+        df,
+        names_exact=["Lineitem sku", "Variant SKU", "SKU"],
+        names_sub=["sku"]
+    )
+    qty_col = _pick(
+        df,
+        names_exact=["Lineitem quantity", "Quantity"],
+        names_sub=["quantity", "qty"]
+    )
+    name_col = _pick(
+        df,
+        names_exact=["Lineitem name", "Product Title", "Title", "Name"],
+        names_sub=["name", "title"]
+    )
 
-    # campi minimi
-    if not (c_sku and c_qty and (c_date_paid or c_date_crea)):
+    if not date_col or not sku_col or not qty_col:
+        # colonne minime non trovate → ritorna vuoto
         return pd.DataFrame()
 
-    # scegli data: Paid at > Created at
-    date_raw = df[c_date_paid] if c_date_paid else df[c_date_crea]
-    date_parsed = pd.to_datetime(date_raw, errors="coerce").dt.tz_localize(None).dt.date
-    out = pd.DataFrame()
-    out["date"] = pd.to_datetime(date_parsed)
-    out["sku"]  = df[c_sku].astype(str).str.strip()
-    out["product_name"] = (df[c_pname] if c_pname else "").astype(str)
-    out["units_sold"]     = pd.to_numeric(df[c_qty], errors="coerce").fillna(0).astype(int)
-    out["units_sold_b2c"] = out["units_sold"]
-    out["units_sold_b2b"] = 0
-    if c_ord:
-        out["order_id"] = df[c_ord].astype(str)
+    out = df[[date_col, sku_col, qty_col] + ([name_col] if name_col else [])].copy()
 
-    # filtra pagati se disponibile
-    if c_fin:
-        ok = df[c_fin].astype(str).str.lower().isin(["paid","partially_paid","authorized"])
-        out = out[ok].copy()
+    # Parse datetime ROBUSTO
+    out["date"] = pd.to_datetime(out[date_col], errors="coerce", utc=False)
+    # Nota: se Shopify esporta in ISO con timezone, puoi forzare:
+    # out["date"] = pd.to_datetime(out[date_col], errors="coerce", utc=True).dt.tz_convert(None)
 
-    out = out.dropna(subset=["date","sku"])
-    out = out[out["units_sold"] > 0]
+    out = out.dropna(subset=["date"])
+    out["sku"] = out[sku_col].astype(str).str.strip()
+    out["product_name"] = out[name_col].astype(str).str.strip() if name_col else out["sku"]
 
-    # aggrega a granularità (date, sku, product_name)
-    out = (out.groupby(["date","sku","product_name"], as_index=False)
-              .agg({"units_sold":"sum","units_sold_b2c":"sum","units_sold_b2b":"sum"}))
-    return out
+    # Quantità
+    q = pd.to_numeric(out[qty_col].str.replace(",", ".", regex=False), errors="coerce").fillna(0)
+    out["units_sold"] = q.astype(int)
+
+    # Solo righe utili (sku non vuoti e qty>0)
+    out = out[(out["sku"] != "") & (out["units_sold"] > 0)].copy()
+
+    # Aggrega per giorno/SKU (se nel CSV ci sono più righe al giorno)
+    out = (
+        out.groupby([out["date"].dt.normalize(), "sku", "product_name"], as_index=False)["units_sold"]
+           .sum()
+           .rename(columns={"date": "date"})
+           .sort_values("date")
+           .reset_index(drop=True)
+    )
+
+    # Garantisce dtype datetime64[ns]
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    return out[["date", "sku", "product_name", "units_sold"]]
 
 @st.cache_data
 def _parse_movements_from_bytes(data: bytes, name: str) -> pd.DataFrame:
@@ -1503,7 +1527,11 @@ def main():
                             if test_df.empty:
                                 st.warning("Baseline caricata ma parsing vuoto: verifica le colonne dell'export.")
                             else:
-                                st.info(f"Baseline OK. Righe utili: {len(test_df)} | Periodo: {test_df['date'].min().date()} → {test_df['date'].max().date()}")
+                                # garantisci tipo datetime
+                                test_df["date"] = pd.to_datetime(test_df["date"], errors="coerce")
+                                dmin = test_df["date"].min()
+                                dmax = test_df["date"].max()
+                                st.info(f"Baseline OK. Righe utili: {len(test_df)} | Periodo: {dmin:%Y-%m-%d} → {dmax:%Y-%m-%d}")
                 except Exception as e:
                     st.error(f"Errore durante la registrazione baseline: {e}")
 
