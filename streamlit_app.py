@@ -1738,19 +1738,22 @@ def main():
                 # Tieni solo le colonne allineate
                 b2c_base_std = b2c_base_std[["date","sku","product_name","units_sold","units_sold_b2b","units_sold_b2c"]]
 
-                # ---- 3.5) Evita doppio conteggio: tieni baseline solo PRIMA della prima data presente nei file non-baseline per quel root
-                # (usa la sku_root già calcolata su df)
+                # --- Anti-overlap: tieni baseline solo PRIMA della prima data presente nei file non-baseline per quel root
+                # Ricostruisci sku_root qui, perché l'abbiamo appena droppata con la selezione colonne
+                b2c_base_std["sku_root"] = b2c_base_std["sku"].astype(str).map(_root)
+
+                # Prima data presente nei file non-baseline per ciascun root
                 first_df_date = (
-                    df.groupby("sku_root", as_index=False)["date"]
-                    .min()
+                    df[["sku_root","date"]]
+                    .groupby("sku_root", as_index=False)["date"].min()
                     .rename(columns={"date":"first_date"})
                 )
 
-                # unisci e filtra
+                # Merge e filtro
                 b2c_base_std = b2c_base_std.merge(first_df_date, on="sku_root", how="left")
                 b2c_base_std = b2c_base_std[
                     b2c_base_std["first_date"].isna() | (b2c_base_std["date"] < b2c_base_std["first_date"])
-                ].drop(columns="first_date")
+                ].drop(columns=["first_date", "sku_root"])
 
                 # ---- 4) Concat + groupby (per data/sku/prodotto)
                 merged = pd.concat(
