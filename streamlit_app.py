@@ -1955,40 +1955,38 @@ def main():
 
         # Autosize: 1) autosize a contenuto (escludendo Nome Prodotto) 2) fit al viewport 3) assicura min larghezza al prodotto
         gb.configure_grid_options(
-            gb.configure_grid_options(
-                onFirstDataRendered=JsCode("""
-                    function(params){
-                        // prendi tutti gli id colonna visibili
-                        const allCols = params.columnApi.getAllDisplayedColumns().map(c => c.getColId());
+            onFirstDataRendered=JsCode("""
+                function(params){
+                    // lascia finire il rendering delle righe
+                    setTimeout(function(){
+                        var excludeId = 'Nome Prodotto';
+                        var all = params.columnApi.getAllDisplayedColumns();
+                        var ids = [];
+                        for (var i = 0; i < all.length; i++) {
+                            var id = all[i].getColId ? all[i].getColId() : null;
+                            if (id && id !== excludeId) ids.push(id);
+                        }
 
-                        // escludi "Nome Prodotto" dall'autosize
-                        const excludeId = 'Nome Prodotto';
-                        const target = allCols.filter(id => id !== excludeId);
-
-                        // autosize al contenuto per le altre colonne
                         try {
-                            params.columnApi.autoSizeColumns(target, false); // skipHeader=false => include header
+                            // autosize al contenuto (header incluso)
+                            params.columnApi.autoSizeColumns(ids, false);
                         } catch(e) {}
 
-                        // imposta larghezza "Nome Prodotto"
                         try {
-                            const current = params.columnApi.getColumn(excludeId);
-                            if (current) {
-                                const min = 320;   // leggermente più largo di prima
-                                const curW = current.getActualWidth ? current.getActualWidth() : min;
-                                params.columnApi.setColumnWidths([{ key: excludeId, newWidth: Math.max(curW, min) }]);
-                                // header wrapping e altezza
-                                current.getColDef().wrapHeaderText = true;
-                                current.getColDef().autoHeaderHeight = true;
+                            // imposta larghezza minima per Nome Prodotto
+                            var min = 320;
+                            params.columnApi.setColumnWidths([{ key: excludeId, newWidth: min }]);
+                            var col = params.columnApi.getColumn(excludeId);
+                            if (col && col.getColDef){
+                                col.getColDef().wrapHeaderText = true;
+                                col.getColDef().autoHeaderHeight = true;
                                 params.api.refreshHeader();
                             }
                         } catch(e) {}
-                    }
-                """)
-            )
-
+                    }, 0);
+                }
+            """)
         )
-
         grid_options = gb.build()
 
 
