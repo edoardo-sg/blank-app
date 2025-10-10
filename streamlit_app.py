@@ -1955,27 +1955,38 @@ def main():
 
         # Autosize: 1) autosize a contenuto (escludendo Nome Prodotto) 2) fit al viewport 3) assicura min larghezza al prodotto
         gb.configure_grid_options(
-            onFirstDataRendered=JsCode(f"""
-                function(params){{
-                var allCols = params.columnApi.getAllColumns().map(c => c.getColId());
-                var exclude = ['{col_product}'];
-                var toSize = allCols.filter(id => exclude.indexOf(id) === -1);
+            gb.configure_grid_options(
+                onFirstDataRendered=JsCode("""
+                    function(params){
+                        // prendi tutti gli id colonna visibili
+                        const allCols = params.columnApi.getAllDisplayedColumns().map(c => c.getColId());
 
-                // 1) autosize a contenuto per le colonne non-prodotto
-                params.columnApi.autoSizeColumns(toSize, false);
+                        // escludi "Nome Prodotto" dall'autosize
+                        const excludeId = 'Nome Prodotto';
+                        const target = allCols.filter(id => id !== excludeId);
 
-                // 2) adatta la tabella alla larghezza (il prodotto è escluso dal fit)
-                params.api.sizeColumnsToFit();
+                        // autosize al contenuto per le altre colonne
+                        try {
+                            params.columnApi.autoSizeColumns(target, false); // skipHeader=false => include header
+                        } catch(e) {}
 
-                // 3) assicura il prodotto "leggermente più largo"
-                try {{
-                    var pcol = params.columnApi.getColumn('{col_product}');
-                    var cur  = pcol.getActualWidth();
-                    var want = Math.max(cur, 360);
-                    params.columnApi.setColumnWidths([{{ key: '{col_product}', newWidth: want }}]);
-                }} catch(e) {{}}
-                }}
-            """)
+                        // imposta larghezza "Nome Prodotto"
+                        try {
+                            const current = params.columnApi.getColumn(excludeId);
+                            if (current) {
+                                const min = 320;   // leggermente più largo di prima
+                                const curW = current.getActualWidth ? current.getActualWidth() : min;
+                                params.columnApi.setColumnWidths([{ key: excludeId, newWidth: Math.max(curW, min) }]);
+                                // header wrapping e altezza
+                                current.getColDef().wrapHeaderText = true;
+                                current.getColDef().autoHeaderHeight = true;
+                                params.api.refreshHeader();
+                            }
+                        } catch(e) {}
+                    }
+                """)
+            )
+
         )
 
         grid_options = gb.build()
