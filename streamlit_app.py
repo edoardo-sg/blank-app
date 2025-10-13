@@ -1911,6 +1911,43 @@ def main():
 
         gb = GridOptionsBuilder.from_dataframe(show_df)
 
+                # Rendi editabili MOQ e Lead Time (con coercizione a intero)
+        gb.configure_column(
+            "MOQ",
+            editable=True,
+            type=["numericColumn"],
+            cellEditor="agTextCellEditor",
+            valueParser=JsCode("""
+                function(p){
+                    var v = parseInt(p.newValue, 10);
+                    if (isNaN(v)) v = p.oldValue || 1;
+                    v = Math.max(1, Math.floor(v));
+                    return v;
+                }
+            """),
+            cellStyle={'textAlign': 'right'}
+        )
+
+        gb.configure_column(
+            "Lead Time",
+            editable=True,
+            type=["numericColumn"],
+            cellEditor="agTextCellEditor",
+            valueParser=JsCode("""
+                function(p){
+                    var v = parseInt(p.newValue, 10);
+                    if (isNaN(v)) v = p.oldValue || 0;
+                    v = Math.max(0, Math.floor(v));
+                    return v;
+                }
+            """),
+            cellStyle={'textAlign': 'right'}
+        )
+
+        # (opzionale) avvia l’editing con un solo click
+        gb.configure_grid_options(singleClickEdit=True)
+
+
         # ID riga stabile
         gb.configure_grid_options(
             getRowId=JsCode("function(p){return p.data && (p.data.SKU || p.data.sku);}"),
@@ -2037,7 +2074,8 @@ def main():
                 save_product_settings(curr)
                 st.toast("✅ Impostazioni prodotto salvate (MOQ / Lead Time).", icon="💾")
                 # le impostazioni impattano sui calcoli → rifai il run così le vedi subito
-                st.experimental_rerun()
+                st.rerun()
+
         else:
             st.warning("Non trovo le colonne SKU / MOQ / Lead Time nella griglia: impossibile salvare.", icon="⚠️")
 
@@ -2096,21 +2134,6 @@ def main():
         if not sku_show:
             st.error(f"Chiavi disponibili nella riga selezionata: {list(selected_row.keys())}")
             st.stop()
-
-        # --- Recupero riga selezionata da Ag-Grid (robusto) ---
-        selected_rows = grid_response.get("selected_rows", [])
-
-        # Se AgGrid restituisce un DataFrame, converti in list-of-dicts
-        if isinstance(selected_rows, pd.DataFrame):
-            selected_rows = selected_rows.to_dict("records")
-
-        # Controllo “vuoto” sicuro
-        if selected_rows is None or len(selected_rows) == 0:
-            st.info("Seleziona un prodotto nella tabella per vedere il dettaglio.")
-            st.stop()
-
-        # Prima (e unica) riga selezionata
-        selected_row = selected_rows[0]
 
         # Nomi colonne robusti (a seconda dei rename fatti a monte)
         sku_show  = selected_row.get("SKU") or selected_row.get("sku")
@@ -2215,7 +2238,7 @@ def main():
         c1, c2 = st.columns(2)
         with c1:
             chart_w = create_forecast_chart(daily_sales_show, forecast_show, name_show, freq=freq)
-            st.plotly_chart(chart_w, use_container_width=True)
+            st.plotly_chart(chart_w, width="stretch")
         with c2:
             # Mostra anche split canale (sovrapposto): qui faccio storico B2B/B2C e forecast B2B/B2C come due linee
             hist_b2b, fc_b2b = _aggregate_series_for_display(daily_b2b_show, forecast_b2b_show, freq=freq)
@@ -2277,7 +2300,7 @@ def main():
             hist_df = hist_for_table.tail(12).reset_index()
             hist_df.columns = ['Periodo', 'Vendite']
             hist_df['Periodo'] = hist_df['Periodo'].dt.strftime('%Y-%m-%d')
-            st.dataframe(hist_df, use_container_width=True, hide_index=True)
+            st.dataframe(hist_df, width="stretch", hide_index=True)
         with colh2:
             st.subheader(translations['it']['forecast'])
             _, fc_for_table = _aggregate_series_for_display(daily_sales_show, forecast_show, freq=freq)
