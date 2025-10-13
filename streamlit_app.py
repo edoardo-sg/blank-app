@@ -2238,7 +2238,16 @@ def main():
         c1, c2 = st.columns(2)
         with c1:
             chart_w = create_forecast_chart(daily_sales_show, forecast_show, name_show, freq=freq)
-            st.plotly_chart(chart_w, width="stretch")
+            st.plotly_chart(
+                chart_w,
+                width="stretch",
+                config={
+                        "displayModeBar": True,   # se vuoi la toolbar
+                        "scrollZoom": True,       # zoom con scroll
+                        "editable": False,        # disegno/drag off
+                        "responsive": True        # facoltativo
+                    }
+                )
         with c2:
             # Mostra anche split canale (sovrapposto): qui faccio storico B2B/B2C e forecast B2B/B2C come due linee
             hist_b2b, fc_b2b = _aggregate_series_for_display(daily_b2b_show, forecast_b2b_show, freq=freq)
@@ -2289,8 +2298,7 @@ def main():
                 xaxis_title='Periodo', yaxis_title='Unità',
                 hovermode='x unified', height=480, showlegend=True
             )
-            st.plotly_chart(fig_split, use_container_width=True)
-
+            st.plotly_chart(fig_split, width="stretch", config={"displayModeBar": True, "scrollZoom": True})
 
         colh1, colh2 = st.columns(2)
         with colh1:
@@ -2309,7 +2317,7 @@ def main():
                 fc_df.columns = ['Periodo', 'Previsione']
                 fc_df['Previsione'] = fc_df['Previsione'].round().astype(int)
                 fc_df['Periodo'] = fc_df['Periodo'].dt.strftime('%Y-%m-%d')
-                st.dataframe(fc_df, use_container_width=True, hide_index=True)
+                st.dataframe(fc_df, width="stretch", hide_index=True)
             else:
                 st.info("Dati insufficienti per la previsione")
 
